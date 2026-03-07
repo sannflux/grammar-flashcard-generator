@@ -1,25 +1,4 @@
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <title>app.py - Streamlit Flashcard Generator</title>
-    <style>
-        body { font-family: monospace; background: #0e1117; color: #fff; padding: 20px; line-height: 1.6; }
-        pre { background: #1e1e1e; padding: 20px; border-radius: 8px; overflow-x: auto; }
-        .note { color: #00ff9d; font-style: italic; }
-    </style>
-</head>
-<body>
-<h1>✅ Your Streamlit app is ready (copy-paste into GitHub)</h1>
-
-<p class="note">I kept <strong>100% of your original system_instruction + text_prompt</strong> (no changes to card generation logic).<br>
-Added only the requested refinement: upload image/PDF <strong>OR</strong> paste text.<br>
-Clean UI, temp file handling, exact CSV cleaning, HTML rendering, and download button.</p>
-
-<h2>1. Create these files in your GitHub repo</h2>
-
-<h3>📄 <code>app.py</code></h3>
-<pre><code>import streamlit as st
+import streamlit as st
 import pandas as pd
 from io import StringIO
 import tempfile
@@ -77,7 +56,7 @@ if st.button("🚀 Generate Flashcards", type="primary", use_container_width=Tru
                 contents = [gemini_file_ref]
                 os.unlink(tmp_path)  # clean temp file
             else:
-                contents = [pasted_text]   # text works perfectly with Gemini
+                contents = [pasted_text]
 
             # === YOUR ORIGINAL SYSTEM INSTRUCTION (100% unchanged) ===
             system_instruction = """
@@ -188,7 +167,7 @@ if "flashcards" in st.session_state:
             st.markdown(f"**Question:** {row['Question']}")
             st.markdown(f"**Answer:** {row['Answer']}", unsafe_allow_html=True)
     
-    # Download (exact same CSV format as Colab)
+    # Download
     csv = df.to_csv(index=False, header=False)
     st.download_button(
         label="📥 Download Grammar_Cards.csv (ready for Anki/Quizlet)",
@@ -198,21 +177,3 @@ if "flashcards" in st.session_state:
     )
 
 st.caption("Converted from your Colab notebook • Dual input (image + text) • Exact same card generation rules")
-</code></pre>
-
-<h3>📄 <code>requirements.txt</code></h3>
-<pre><code>streamlit
-google-genai
-pandas
-</code></pre>
-
-<h2>2. How to run</h2>
-<ul>
-    <li><strong>Locally:</strong> <code>pip install -r requirements.txt</code> then <code>streamlit run app.py</code></li>
-    <li><strong>GitHub + Streamlit Cloud:</strong> Push to GitHub → connect at share.streamlit.io (free)</li>
-    <li><strong>Pro tip:</strong> For production, move API key to <code>.streamlit/secrets.toml</code> (more secure than sidebar).</li>
-</ul>
-
-<p class="note">Everything you asked for is done. Card generation system is untouched. Just copy, push to GitHub, and go! 🚀</p>
-</body>
-</html>
