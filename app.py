@@ -17,7 +17,7 @@ import io
 
 # ====================== 1. SAFE IMPORTS & CONFIGURATION ======================
 st.set_page_config(
-    page_title="Flashcard Library Pro v3.1", 
+    page_title="Flashcard Library Pro v3.2", 
     page_icon="🧠", 
     layout="wide",
     initial_sidebar_state="expanded"
@@ -363,14 +363,14 @@ def section_study():
         card = queue[idx]
         st.progress((idx + 1) / len(queue), text=f"Card {idx+1}/{len(queue)}")
         
-        # HTML Content Preparation to fix rendering bugs
+        # HTML Content Preparation
         back_content = card['back'] if st.session_state["show_answer"] else "<span style='color:#ccc; font-style:italic'>(Think...)</span>"
         explanation_html = ""
         if st.session_state["show_answer"] and card.get("explanation"):
             explanation_html = f'<div class="card-explanation">💡 {card["explanation"]}</div>'
 
         with st.container():
-            # FIXED: Broken down into cleaner f-string to ensure HTML renders
+            # FIXED: HTML Rendering Structure
             html_code = f"""
             <div class="flashcard">
                 <div class="card-tag">{card['tag']}</div>
@@ -499,14 +499,15 @@ def main():
         st.divider()
         page = st.radio("Navigation", ["Study Mode", "Generator", "Library & Exports"], label_visibility="collapsed")
         
-        st.caption("v3.1 - Anki Ready")
+        st.caption("v3.2 - Anki Ready")
 
     if page == "Generator":
         section_generator(api_key)
     elif page == "Study Mode":
         section_study()
     elif page == "Library & Exports":
-        section_librrary()
+        section_library()
 
 if __name__ == "__main__":
     main()
+    
