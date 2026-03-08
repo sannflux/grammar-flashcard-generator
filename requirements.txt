@@ -2,8 +2,8 @@ streamlit
 pandas
 google-genai
 pydantic
-pillow
-pypdf
-beautifulsoup4
 youtube-transcript-api
+beautifulsoup4
 requests
+altair
+Pillow
