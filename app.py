@@ -13,16 +13,27 @@ from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
 from typing import List, Optional
-from bs4 import BeautifulSoup
-from youtube_transcript_api import YouTubeTranscriptApi
 
-# ====================== 1. CONFIGURATION & PAGE SETUP ======================
+# ====================== 1. SAFE IMPORTS & CONFIGURATION ======================
 st.set_page_config(
-    page_title="Flashcard Library Pro v2", 
+    page_title="Flashcard Library Pro v2.1", 
     page_icon="🧠", 
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# Optional Dependencies (Graceful Degradation)
+try:
+    from bs4 import BeautifulSoup
+    BS4_AVAILABLE = True
+except ImportError:
+    BS4_AVAILABLE = False
+
+try:
+    from youtube_transcript_api import YouTubeTranscriptApi
+    YOUTUBE_AVAILABLE = True
+except ImportError:
+    YOUTUBE_AVAILABLE = False
 
 # Initialize Session State
 DEFAULT_STATE = {
@@ -61,10 +72,6 @@ def init_db():
         )''')
         
         # Cards Table with SM-2 Algorithm Fields
-        # ease_factor: Multiplier for interval (default 2.5)
-        # interval: Days until next review
-        # repetitions: Consecutive correct answers
-        # next_review: ISO Date string
         c.execute('''CREATE TABLE IF NOT EXISTS cards (
             id INTEGER PRIMARY KEY AUTOINCREMENT, 
             deck_id INTEGER, 
@@ -93,34 +100,35 @@ def update_card_sm2(card_id, quality):
         c.execute("SELECT ease_factor, interval, repetitions FROM cards WHERE id=?", (card_id,))
         row = c.fetchone()
         
-        ease, interval, reps = row['ease_factor'], row['interval'], row['repetitions']
-        
-        if quality < 3:
-            # If user failed, reset repetitions and interval
-            reps = 0
-            interval = 1
-        else:
-            # Success path
-            if reps == 0:
-                interval = 1
-            elif reps == 1:
-                interval = 6
-            else:
-                interval = math.ceil(interval * ease)
+        if row:
+            ease, interval, reps = row['ease_factor'], row['interval'], row['repetitions']
             
-            reps += 1
-            # Adjust Ease Factor (standard SM-2 formula)
-            ease = ease + (0.1 - (5 - quality) * (0.08 + (5 - quality) * 0.02))
-            if ease < 1.3: ease = 1.3 # Minimum ease cap
+            if quality < 3:
+                # If user failed, reset repetitions and interval
+                reps = 0
+                interval = 1
+            else:
+                # Success path
+                if reps == 0:
+                    interval = 1
+                elif reps == 1:
+                    interval = 6
+                else:
+                    interval = math.ceil(interval * ease)
+                
+                reps += 1
+                # Adjust Ease Factor (standard SM-2 formula)
+                ease = ease + (0.1 - (5 - quality) * (0.08 + (5 - quality) * 0.02))
+                if ease < 1.3: ease = 1.3 # Minimum ease cap
 
-        # Calculate new review date
-        next_review_date = (datetime.now() + timedelta(days=interval)).strftime("%Y-%m-%d")
+            # Calculate new review date
+            next_review_date = (datetime.now() + timedelta(days=interval)).strftime("%Y-%m-%d")
 
-        c.execute('''UPDATE cards 
-                     SET ease_factor=?, interval=?, repetitions=?, next_review=? 
-                     WHERE id=?''', 
-                  (ease, interval, reps, next_review_date, card_id))
-        conn.commit()
+            c.execute('''UPDATE cards 
+                         SET ease_factor=?, interval=?, repetitions=?, next_review=? 
+                         WHERE id=?''', 
+                      (ease, interval, reps, next_review_date, card_id))
+            conn.commit()
 
 # ====================== 4. CONTENT INGESTION ENGINE ======================
 class Flashcard(BaseModel):
@@ -140,6 +148,8 @@ def clean_text(text):
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def fetch_youtube_transcript(url):
+    if not YOUTUBE_AVAILABLE:
+        return "Error: library 'youtube-transcript-api' not installed."
     try:
         video_id = url.split("v=")[1].split("&")[0]
         transcript = YouTubeTranscriptApi.get_transcript(video_id)
@@ -150,6 +160,8 @@ def fetch_youtube_transcript(url):
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def fetch_web_content(url):
+    if not BS4_AVAILABLE:
+        return "Error: library 'beautifulsoup4' not installed."
     try:
         response = requests.get(url, headers={"User-Agent": "Mozilla/5.0"})
         soup = BeautifulSoup(response.content, 'html.parser')
@@ -252,36 +264,35 @@ def section_generator(api_key):
     elif source_type == "Upload PDF":
         uploaded_file = st.file_uploader("Upload PDF", type=["pdf"])
         if uploaded_file:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                tmp.write(uploaded_file.getvalue())
-                tmp_path = tmp.name
-            
-            # Using Gemini's direct file upload (Simplified for this snippet, usually requires File API)
-            # For simplicity in this script, we assume text extraction or use Gemini 1.5 Pro's native multimodal
-            # Here we will prompt user: "For PDFs, please use Gemini 1.5 Pro or extract text first."
             st.info("💡 Pro Tip: For direct PDF analysis, ensure your API key supports Gemini 1.5 Pro.")
-            # Fallback: simple text extraction could go here, but omitted to keep script monolithic & simple.
-            content_text = "Extract relevant concepts from this document." # Placeholder for multimodal
+            # Simplified text extraction placeholder
+            content_text = "Extract relevant concepts from this document."
             
     elif source_type == "YouTube URL":
-        url = st.text_input("Video URL")
-        if url:
-            with st.spinner("Transcribing Video..."):
-                content_text = fetch_youtube_transcript(url)
-                if "Error" not in content_text:
-                    st.success(f"Transcript loaded ({len(content_text)} chars)")
-                else:
-                    st.error(content_text)
+        if not YOUTUBE_AVAILABLE:
+            st.warning("⚠️ 'youtube-transcript-api' is missing. Please install it to use this feature.")
+        else:
+            url = st.text_input("Video URL")
+            if url:
+                with st.spinner("Transcribing Video..."):
+                    content_text = fetch_youtube_transcript(url)
+                    if "Error" not in content_text:
+                        st.success(f"Transcript loaded ({len(content_text)} chars)")
+                    else:
+                        st.error(content_text)
                     
     elif source_type == "Web Article":
-        url = st.text_input("Article URL")
-        if url:
-            with st.spinner("Scraping Article..."):
-                content_text = fetch_web_content(url)
-                if "Error" not in content_text:
-                    st.success(f"Content loaded ({len(content_text)} chars)")
-                else:
-                    st.error(content_text)
+        if not BS4_AVAILABLE:
+            st.warning("⚠️ 'beautifulsoup4' is missing. Please install it to use this feature.")
+        else:
+            url = st.text_input("Article URL")
+            if url:
+                with st.spinner("Scraping Article..."):
+                    content_text = fetch_web_content(url)
+                    if "Error" not in content_text:
+                        st.success(f"Content loaded ({len(content_text)} chars)")
+                    else:
+                        st.error(content_text)
 
     # 2. Settings
     col1, col2, col3 = st.columns(3)
@@ -331,12 +342,12 @@ def section_study_mode():
     with get_db_connection() as conn:
         decks = conn.execute("SELECT id, name FROM decks").fetchall()
     
+    if not decks:
+        st.info("Your library is empty. Go to the Generator to create a deck.")
+        return
+
     deck_opts = {d['name']: d['id'] for d in decks}
     selected_deck_name = st.selectbox("Select Deck", list(deck_opts.keys()))
-    
-    if not selected_deck_name:
-        st.info("Create a deck in the Generator first.")
-        return
 
     deck_id = deck_opts[selected_deck_name]
     
@@ -509,7 +520,7 @@ with st.sidebar:
         st.warning("API Key required for generation.")
         
     st.divider()
-    st.caption(f"v2.0.0 | DB: {DB_NAME}")
+    st.caption(f"v2.1.0 | DB: {DB_NAME}")
 
 # Routing
 if nav == "Study Mode":
