@@ -1,3 +1,7 @@
 streamlit
-google-genai
 pandas
+google-genai
+pydantic
+beautifulsoup4
+youtube-transcript-api
+requests
