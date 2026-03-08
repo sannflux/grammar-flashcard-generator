@@ -17,13 +17,13 @@ import io
 
 # ====================== 1. SAFE IMPORTS & CONFIGURATION ======================
 st.set_page_config(
-    page_title="Flashcard Library Pro v3.6", 
+    page_title="Flashcard Library Pro v4.0", 
     page_icon="🧠", 
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# Optional Dependencies
+# Dependencies Check
 try:
     from bs4 import BeautifulSoup
     BS4_AVAILABLE = True
@@ -35,6 +35,12 @@ try:
     YOUTUBE_AVAILABLE = True
 except ImportError:
     YOUTUBE_AVAILABLE = False
+
+try:
+    from pypdf import PdfReader
+    PDF_AVAILABLE = True
+except ImportError:
+    PDF_AVAILABLE = False
 
 # Initialize Session State
 DEFAULT_STATE = {
@@ -87,7 +93,7 @@ def init_db():
             FOREIGN KEY(deck_id) REFERENCES decks(id) ON DELETE CASCADE
         )''')
         
-        # Migrations for existing DBs
+        # Migrations
         try:
             c.execute("SELECT explanation FROM cards LIMIT 1")
         except sqlite3.OperationalError:
@@ -136,6 +142,13 @@ def update_card_sm2(card_id, quality):
                       (ease, interval, reps, next_review, last_reviewed, card_id))
             conn.commit()
 
+def delete_deck(deck_name):
+    """Deletes a deck and all associated cards."""
+    with get_db_connection() as conn:
+        c = conn.cursor()
+        c.execute("DELETE FROM decks WHERE name=?", (deck_name,))
+        conn.commit()
+
 # ====================== 4. AI CONTENT ENGINE ======================
 class Flashcard(BaseModel):
     front: str = Field(description="The question/concept. Plain text.")
@@ -155,6 +168,19 @@ def sanitize_json(text):
     text = re.sub(r'^```json', '', text, flags=re.MULTILINE)
     text = re.sub(r'^```', '', text, flags=re.MULTILINE)
     return text.strip()
+
+def extract_pdf_text(uploaded_file):
+    """Extracts text from uploaded PDF."""
+    if not PDF_AVAILABLE:
+        return "Error: pypdf not installed."
+    try:
+        reader = PdfReader(uploaded_file)
+        text = ""
+        for page in reader.pages:
+            text += page.extract_text() + "\n"
+        return text[:25000] # Limit context for Gemini
+    except Exception as e:
+        return f"Error reading PDF: {e}"
 
 def generate_flashcards(api_key, text_content, image_content, difficulty, count_val):
     client = genai.Client(api_key=api_key)
@@ -193,37 +219,70 @@ def generate_flashcards(api_key, text_content, image_content, difficulty, count_
         st.error(f"AI Generation Failed: {e}")
         return []
 
-# ====================== 5. UI COMPONENTS & CSS ======================
+# ====================== 5. UI COMPONENTS & CSS (Theme-Aware) ======================
 def inject_custom_css():
     st.markdown("""
     <style>
+        /* Responsive Card Container with Theme Awareness */
         .flashcard {
-            background-color: #ffffff;
-            border: 1px solid #e0e0e0;
+            background-color: var(--secondary-background-color);
+            border: 1px solid var(--text-color);
             border-radius: 15px;
-            padding: 40px;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.05);
-            min-height: 350px;
+            padding: 30px; /* Reduced padding for mobile */
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            min-height: 300px;
             display: flex;
             flex-direction: column;
             justify-content: center;
             align-items: center;
             text-align: center;
+            margin-bottom: 20px;
         }
-        .stApp[data-theme='dark'] .flashcard {
-            background-color: #262730;
-            border-color: #444;
+        
+        .card-front { 
+            font-size: 22px; 
+            font-weight: 700; 
+            margin-bottom: 20px; 
+            color: var(--text-color);
         }
-        .card-front { font-size: 26px; font-weight: 700; margin-bottom: 20px; }
-        .card-back { font-size: 22px; margin-bottom: 15px; color: #009688; }
-        .card-explanation { font-size: 16px; color: #666; font-style: italic; border-top: 1px solid #eee; padding-top: 10px; width: 100%;}
-        .stApp[data-theme='dark'] .card-explanation { color: #aaa; border-top: 1px solid #444;}
+        
+        .card-back { 
+            font-size: 18px; 
+            margin-bottom: 15px; 
+            color: var(--primary-color);
+            line-height: 1.5;
+        }
+        
+        .card-explanation { 
+            font-size: 14px; 
+            color: var(--text-color); 
+            opacity: 0.8;
+            font-style: italic; 
+            border-top: 1px solid var(--text-color); 
+            padding-top: 10px; 
+            width: 100%;
+        }
+        
         .card-tag { 
-            background: #f0f2f6; color: #555; padding: 4px 10px; 
-            border-radius: 20px; font-size: 12px; font-weight: 600; text-transform: uppercase;
+            background: var(--primary-color); 
+            color: #ffffff; 
+            padding: 4px 10px; 
+            border-radius: 20px; 
+            font-size: 12px; 
+            font-weight: 600; 
+            text-transform: uppercase;
             margin-bottom: 15px;
         }
-        .stApp[data-theme='dark'] .card-tag { background: #333; color: #aaa; }
+
+        /* Mobile Adjustments */
+        @media (max-width: 600px) {
+            .flashcard {
+                padding: 20px;
+                min-height: 250px;
+            }
+            .card-front { font-size: 18px; }
+            .card-back { font-size: 16px; }
+        }
     </style>
     """, unsafe_allow_html=True)
 
@@ -242,6 +301,19 @@ def section_generator(api_key):
         
         if source_type == "Text/Paste":
             content_text = st.text_area("Paste Notes Here", height=200)
+        
+        elif source_type == "Upload PDF":
+            if PDF_AVAILABLE:
+                pdf_file = st.file_uploader("Upload PDF Document", type=["pdf"])
+                if pdf_file:
+                    with st.spinner("Extracting text from PDF..."):
+                        content_text = extract_pdf_text(pdf_file)
+                        if "Error" not in content_text:
+                            st.success(f"PDF Loaded ({len(content_text)} chars)")
+                        else:
+                            st.error(content_text)
+            else:
+                st.warning("Please install 'pypdf' to use this feature.")
             
         elif source_type == "Image Analysis":
             img_file = st.file_uploader("Upload Diagram/Chart", type=["png", "jpg", "jpeg"])
@@ -364,13 +436,13 @@ def section_study():
         st.progress((idx + 1) / len(queue), text=f"Card {idx+1}/{len(queue)}")
         
         # HTML Content Preparation
-        back_content = card['back'] if st.session_state["show_answer"] else "<span style='color:#ccc; font-style:italic'>(Think...)</span>"
+        back_content = card['back'] if st.session_state["show_answer"] else "<span style='opacity:0.6; font-style:italic'>(Think...)</span>"
         explanation_html = ""
         if st.session_state["show_answer"] and card.get("explanation"):
             explanation_html = f'<div class="card-explanation">💡 {card["explanation"]}</div>'
 
         with st.container():
-            # HTML Rendering Structure
+            # HTML Rendering Structure (Theme Aware)
             html_code = f"""
             <div class="flashcard">
                 <div class="card-tag">{card['tag']}</div>
@@ -415,7 +487,7 @@ def section_study():
             st.rerun()
 
 def section_library():
-    st.header("📚 Library & Exports")
+    st.header("📚 Library & Management")
     
     with get_db_connection() as conn:
         df_cards = pd.read_sql("SELECT id, deck_id, ease_factor, repetitions, last_reviewed FROM cards", conn)
@@ -425,82 +497,78 @@ def section_library():
         st.info("No decks found.")
         return
 
-    # 1. Deck Stats
-    if not df_cards.empty:
-        st.subheader("Deck Health")
-        
-        # Explicit suffixes to prevent KeyErrors
-        df_merged = pd.merge(df_cards, decks, left_on="deck_id", right_on="id", suffixes=('_card', '_deck'))
-        
-        deck_stats = df_merged.groupby("name").agg({
-            "repetitions": "mean",
-            "ease_factor": "mean",
-            "id_card": "count"
-        }).rename(columns={"id_card": "Total Cards", "repetitions": "Avg Reps", "ease_factor": "Avg Ease"})
-        
-        st.dataframe(deck_stats, use_container_width=True)
+    # Tabs for Organization
+    tab1, tab2, tab3 = st.tabs(["📊 Stats", "📤 Export", "🗑️ Manage Decks"])
 
-    # 2. Anki Export Section
-    st.divider()
-    st.subheader("📤 Export to Anki")
-    col_exp, col_info = st.columns([1, 2])
-    
-    with col_exp:
-        export_deck_name = st.selectbox("Select Deck to Export", decks['name'].tolist())
-        
-        # Initialize Variables
-        csv_data = None
-        clean_filename = "anki_deck.csv"
-        
-        if export_deck_name:
-            clean_filename = re.sub(r'[^a-zA-Z0-9]', '_', export_deck_name) + "_anki.csv"
+    with tab1:
+        if notdf_cards.empty:
+            st.subheader("Deck Health")
+            df_merged = pd.merge(df_cards, decks, left_on="deck_id", right_on="id", suffixes=('_card', '_deck'))
             
-            # FIXED: Explicitly cast to native int to avoid NumPy/SQLite mismatch
-            deck_id_raw = decks[decks['name'] == export_deck_name].iloc[0]['id']
-            deck_id = int(deck_id_raw)
+            deck_stats = df_merged.groupby("name").agg({
+                "repetitions": "mean",
+                "ease_factor": "mean",
+                "id_card": "count"
+            }).rename(columns={"id_card": "Total Cards", "repetitions": "Avg Reps", "ease_factor": "Avg Ease"})
             
-            with get_db_connection() as conn:
-                cards_df = pd.read_sql("SELECT front, back, tag FROM cards WHERE deck_id=?", conn, params=(deck_id,))
+            st.dataframe(deck_stats, use_container_width=True)
             
-            if not cards_df.empty:
-                csv_data = cards_df.to_csv(index=False, header=False).encode('utf-8')
-            else:
-                st.warning("Selected deck has no cards.")
-            
-        st.download_button(
-            label="Download Anki CSV",
-            data=csv_data if csv_data else b"Error", 
-            file_name=clean_filename,
-            mime="text/csv",
-            disabled=(csv_data is None),
-            key=f"dl_btn_{clean_filename}",
-            help="Import this file into Anki."
-        )
+            # Heatmap
+            if df_cards['last_reviewed'].notna().any():
+                st.subheader("Study Activity")
+                df_cards['last_reviewed'] = pd.to_datetime(df_cards['last_reviewed']).dt.date
+                activity = df_cards['last_reviewed'].value_counts().reset_index()
+                activity.columns = ['date', 'count']
+                
+                chart = alt.Chart(activity).mark_rect().encode(
+                    x=alt.X('date:O', title="Date"),
+                    y=alt.Y('count:Q', title="Cards Reviewed"),
+                    color=alt.Color('count', scale=alt.Scale(scheme='greens'))
+                ).properties(height=200)
+                st.altair_chart(chart, use_container_width=True)
+        else:
+            st.info("Start studying to see stats!")
 
-    with col_info:
-        st.info("""
-        **How to Import into Anki:**
-        1. Download the CSV.
-        2. Open Anki -> File -> Import.
-        3. Select the file.
-        4. Ensure 'Field Separator' is Comma.
-        5. Map fields: Field 1 -> Front, Field 2 -> Back, Field 3 -> Tags.
-        """)
+    with tab2:
+        col_exp, col_info = st.columns([1, 2])
+        with col_exp:
+            export_deck_name = st.selectbox("Select Deck to Export", decks['name'].tolist())
+            
+            csv_data = None
+            clean_filename = "anki_deck.csv"
+            
+            if export_deck_name:
+                clean_filename = re.sub(r'[^a-zA-Z0-9]', '_', export_deck_name) + "_anki.csv"
+                deck_id = int(decks[decks['name'] == export_deck_name].iloc[0]['id'])
+                
+                with get_db_connection() as conn:
+                    cards_df = pd.read_sql("SELECT front, back, tag FROM cards WHERE deck_id=?", conn, params=(deck_id,))
+                
+                if not cards_df.empty:
+                    csv_data = cards_df.to_csv(index=False, header=False).encode('utf-8')
+                else:
+                    st.warning("Selected deck has no cards.")
+                
+            st.download_button(
+                label="Download Anki CSV",
+                data=csv_data if csv_data else b"Error", 
+                file_name=clean_filename,
+                mime="text/csv",
+                disabled=(csv_data is None),
+                key=f"dl_btn_{clean_filename}"
+            )
+        with col_info:
+            st.info("Import format: Front, Back, Tag")
 
-    # 3. Heatmap
-    if not df_cards.empty and df_cards['last_reviewed'].notna().any():
-        st.divider()
-        st.subheader("Study Activity")
-        df_cards['last_reviewed'] = pd.to_datetime(df_cards['last_reviewed']).dt.date
-        activity = df_cards['last_reviewed'].value_counts().reset_index()
-        activity.columns = ['date', 'count']
+    with tab3:
+        st.subheader("Danger Zone")
+        deck_to_delete = st.selectbox("Select Deck to Delete", decks['name'].tolist(), key="del_select")
         
-        chart = alt.Chart(activity).mark_rect().encode(
-            x=alt.X('date:O', title="Date"),
-            y=alt.Y('count:Q', title="Cards Reviewed"),
-            color=alt.Color('count', scale=alt.Scale(scheme='greens'))
-        ).properties(height=200)
-        st.altair_chart(chart, use_container_width=True)
+        if st.button(f"🗑️ Delete '{deck_to_delete}' Permanently", type="primary"):
+            delete_deck(deck_to_delete)
+            st.toast(f"Deleted {deck_to_delete}")
+            time.sleep(1)
+            st.rerun()
 
 # ====================== 7. MAIN NAVIGATION ======================
 def main():
@@ -509,19 +577,17 @@ def main():
     with st.sidebar:
         st.title("🧠 Flashcard Pro")
         api_key = st.text_input("Gemini API Key", type="password")
-        if not api_key:
-            st.warning("Enter API Key to generate.")
-            
-        st.divider()
-        page = st.radio("Navigation", ["Study Mode", "Generator", "Library & Exports"], label_visibility="collapsed")
         
-        st.caption("v3.6 - Type Fix")
+        st.divider()
+        page = st.radio("Navigation", ["Study Mode", "Generator", "Library & Stats"], label_visibility="collapsed")
+        
+        st.caption("v4.0 - Mobile Ready")
 
     if page == "Generator":
         section_generator(api_key)
     elif page == "Study Mode":
         section_study()
-    elif page == "Library & Exports":
+    elif page == "Library & Stats":
         section_library()
 
 if __name__ == "__main__":
