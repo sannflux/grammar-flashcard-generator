@@ -6,6 +6,7 @@ import time
 import json
 import sqlite3
 import hashlib
+import re  # Added for regex cleaning
 from datetime import datetime
 from google import genai
 from google.genai import types
@@ -118,7 +119,27 @@ class Flashcard(BaseModel):
 class FlashcardSet(BaseModel):
     cards: List[Flashcard]
 
-# ====================== 4. CACHED AI FUNCTIONS ======================
+# ====================== 4. HELPER: CLEAN MARKDOWN ======================
+def clean_markdown(text):
+    """
+    Sanitizes LLM output to ensure no Markdown leaks into Anki cards.
+    Converts **bold** to <b>bold</b> and *italic* to <i>italic</i>.
+    Removes other markdown symbols.
+    """
+    if not text: return ""
+    
+    # 1. Convert Bold (**text**) -> <b>text</b>
+    text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)
+    
+    # 2. Convert Italic (*text*) -> <i>text</i>
+    text = re.sub(r'\*(.*?)\*', r'<i>\1</i>', text)
+    
+    # 3. Remove remaining markdown artifacts (backticks, hashes)
+    text = text.replace('`', '').replace('#', '')
+    
+    return text.strip()
+
+# ====================== 5. CACHED AI FUNCTIONS ======================
 
 @st.cache_data(show_spinner=False)
 def generate_flashcards_cached(api_key, file_content, file_type, text_input, difficulty, card_count):
@@ -131,8 +152,6 @@ def generate_flashcards_cached(api_key, file_content, file_type, text_input, dif
 
     # Handle File (Re-uploading logic needed here since cache stores result, not the remote file ref)
     if file_content:
-        # We must re-upload to Gemini because the file ref might expire, 
-        # but since this function is cached, it only happens once per unique file content.
         with tempfile.NamedTemporaryFile(delete=False, suffix=f".{file_type}") as tmp:
             tmp.write(file_content)
             tmp_path = tmp.name
@@ -148,13 +167,18 @@ def generate_flashcards_cached(api_key, file_content, file_type, text_input, dif
     # Prompt construction
     count_instruction = f"Generate {card_count} cards." if isinstance(card_count, int) else "Generate a comprehensive set."
     
+    # --- REINFORCED SYSTEM PROMPT ---
     system_prompt = f"""
     You are an expert tutor for {difficulty} students.
-    Task: Create flashcards.
-    Rules:
-    1. Front: Specific question.
-    2. Back: Concise answer (HTML <b>/<i> allowed).
-    3. JSON Output Only.
+    Task: Create active-recall flashcards based on the provided content.
+    
+    STRICT FORMATTING RULES:
+    1. **NO MARKDOWN:** Do not use markdown syntax like **, *, `, or # in the output.
+    2. **HTML ONLY:** For emphasis in the 'back' (Answer) field, use ONLY <b> for bold and <i> for italic.
+    3. **FRONT FIELD:** The Question must be plain text only. No formatting.
+    4. **BACK FIELD:** The Answer must be concise (max 3 sentences).
+    
+    Output must be a valid JSON object matching the schema.
     """
     
     contents.append(f"{count_instruction} Focus on key concepts.")
@@ -185,6 +209,7 @@ def simplify_card_eli5(api_key, front, back):
     prompt = f"""
     Rewrite this flashcard to be simpler (Explain Like I'm 5).
     Keep the meaning but use simpler words.
+    ENSURE OUTPUT HAS NO MARKDOWN. Use <b> tags only if needed.
     
     Original Question: {front}
     Original Answer: {back}
@@ -198,7 +223,7 @@ def simplify_card_eli5(api_key, front, back):
     )
     return json.loads(response.text)
 
-# ====================== 5. CSS STYLING ======================
+# ====================== 6. CSS STYLING ======================
 st.markdown("""
 <style>
     .flashcard-container {
@@ -223,7 +248,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ====================== 6. SIDEBAR: LIBRARY & SETTINGS ======================
+# ====================== 7. SIDEBAR: LIBRARY & SETTINGS ======================
 with st.sidebar:
     st.header("📚 Library & Settings")
     
@@ -247,7 +272,7 @@ with st.sidebar:
     card_count = st.selectbox("Quantity", ["Auto", 5, 10, 20])
     mode = st.radio("Mode", ["Append", "Replace"], index=1)
 
-# ====================== 7. MAIN UI ======================
+# ====================== 8. MAIN UI ======================
 st.title("🧠 Flashcard Library Pro")
 
 # --- Tabs for Creation ---
@@ -279,13 +304,24 @@ with t1:
                 
                 new_data = json.loads(json_str).get("cards", [])
                 
+                # --- POST-PROCESS CLEANING ---
+                # We scrub the data here just in case the LLM ignored instructions
+                cleaned_data = []
+                for card in new_data:
+                    cleaned_data.append({
+                        "front": clean_markdown(card.get("front", "")),
+                        "back": clean_markdown(card.get("back", "")),
+                        "tag": card.get("tag", "")
+                    })
+                
                 if mode == "Replace":
-                    st.session_state["flashcards"] = new_data
+                    st.session_state["flashcards"] = cleaned_data
                     st.session_state["current_deck_name"] = "" # Reset name on new gen
                 else:
-                    st.session_state["flashcards"].extend(new_data)
+                    st.session_state["flashcards"].extend(cleaned_data)
                 
-                st.success(f"Generated {len(new_data)} cards!")
+                st.success(f"Generated {len(cleaned_data)} clean cards!")
+                time.sleep(1) # Small delay for UX
                 st.rerun()
                 
             except Exception as e:
@@ -305,7 +341,7 @@ with t2:
     else:
         st.info("Generate cards first to save them.")
 
-# ====================== 8. CARD PREVIEW & EDITOR ======================
+# ====================== 9. CARD PREVIEW & EDITOR ======================
 if st.session_state["flashcards"]:
     st.divider()
     
@@ -363,9 +399,9 @@ if st.session_state["flashcards"]:
                         with st.spinner("Simplifying..."):
                             try:
                                 simplified = simplify_card_eli5(api_key, current['front'], current['back'])
-                                # Update State directly
-                                st.session_state["flashcards"][idx]['front'] = simplified['front']
-                                st.session_state["flashcards"][idx]['back'] = simplified['back']
+                                # Update State directly & clean output
+                                st.session_state["flashcards"][idx]['front'] = clean_markdown(simplified['front'])
+                                st.session_state["flashcards"][idx]['back'] = clean_markdown(simplified['back'])
                                 st.session_state["flashcards"][idx]['tag'] = current['tag'] + " (Simple)"
                                 st.rerun()
                             except Exception as e:
@@ -373,6 +409,7 @@ if st.session_state["flashcards"]:
 
     # --- EDITOR ---
     with tab_edit:
+        st.info("Double-click cells to edit. Edits are saved to Export automatically.")
         new_df = st.data_editor(df, num_rows="dynamic", use_container_width=True)
         st.session_state["flashcards"] = new_df.to_dict('records')
         
