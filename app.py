@@ -17,7 +17,7 @@ import io
 
 # ====================== 1. SAFE IMPORTS & CONFIGURATION ======================
 st.set_page_config(
-    page_title="Flashcard Library Pro v3.5", 
+    page_title="Flashcard Library Pro v3.6", 
     page_icon="🧠", 
     layout="wide",
     initial_sidebar_state="expanded"
@@ -370,7 +370,7 @@ def section_study():
             explanation_html = f'<div class="card-explanation">💡 {card["explanation"]}</div>'
 
         with st.container():
-            # FIXED: HTML Rendering Structure
+            # HTML Rendering Structure
             html_code = f"""
             <div class="flashcard">
                 <div class="card-tag">{card['tag']}</div>
@@ -453,29 +453,28 @@ def section_library():
         clean_filename = "anki_deck.csv"
         
         if export_deck_name:
-            # Sanitize filename (Fixes "Download Failed")
             clean_filename = re.sub(r'[^a-zA-Z0-9]', '_', export_deck_name) + "_anki.csv"
             
-            # Fetch Cards for export
-            deck_id = decks[decks['name'] == export_deck_name].iloc[0]['id']
+            # FIXED: Explicitly cast to native int to avoid NumPy/SQLite mismatch
+            deck_id_raw = decks[decks['name'] == export_deck_name].iloc[0]['id']
+            deck_id = int(deck_id_raw)
+            
             with get_db_connection() as conn:
                 cards_df = pd.read_sql("SELECT front, back, tag FROM cards WHERE deck_id=?", conn, params=(deck_id,))
             
-            # Convert to CSV if cards exist
             if not cards_df.empty:
                 csv_data = cards_df.to_csv(index=False, header=False).encode('utf-8')
             else:
                 st.warning("Selected deck has no cards.")
             
-        # The download button now has data ready immediately
         st.download_button(
             label="Download Anki CSV",
-            data=csv_data if csv_data else b"Error: Empty Deck", 
+            data=csv_data if csv_data else b"Error", 
             file_name=clean_filename,
             mime="text/csv",
-            disabled=(csv_data is None), # Disable if no data
-            key=f"dl_btn_{clean_filename}", # Unique Key (Fixes State Loss)
-            help="Import this file into Anki. It contains Front, Back, and Tags."
+            disabled=(csv_data is None),
+            key=f"dl_btn_{clean_filename}",
+            help="Import this file into Anki."
         )
 
     with col_info:
@@ -516,7 +515,7 @@ def main():
         st.divider()
         page = st.radio("Navigation", ["Study Mode", "Generator", "Library & Exports"], label_visibility="collapsed")
         
-        st.caption("v3.5 - Stable")
+        st.caption("v3.6 - Type Fix")
 
     if page == "Generator":
         section_generator(api_key)
