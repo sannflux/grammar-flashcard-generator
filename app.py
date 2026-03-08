@@ -162,13 +162,36 @@ def fetch_youtube_transcript(url):
 def fetch_web_content(url):
     if not BS4_AVAILABLE:
         return "Error: library 'beautifulsoup4' not installed."
+    
+    # 1. Impersonate a real browser (Chrome on Windows 10)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.google.com/"
+    }
+    
     try:
-        response = requests.get(url, headers={"User-Agent": "Mozilla/5.0"})
+        # 2. Add a Timeout (10 seconds max)
+        response = requests.get(url, headers=headers, timeout=10)
+        
+        # 3. Check for errors (403 Forbidden, 404 Not Found, etc.)
+        response.raise_for_status()
+        
         soup = BeautifulSoup(response.content, 'html.parser')
-        # Kill all script and style elements
-        for script in soup(["script", "style", "nav", "footer"]):
+        
+        # 4. Remove junk elements
+        for script in soup(["script", "style", "nav", "footer", "header", "aside"]):
             script.decompose()
-        return " ".join(soup.stripped_strings)[:15000] # Limit context size
+            
+        text = " ".join(soup.stripped_strings)
+        
+        # 5. Limit text length (to prevent Gemini context errors)
+        return text[:20000] 
+
+    except requests.exceptions.Timeout:
+        return "Error: The website took too long to respond. It might be blocking scrapers."
+    except requests.exceptions.HTTPError as e:
+        return f"Error: The website refused the connection ({e}). Try a different site."
     except Exception as e:
         return f"Error: Could not scrape website. {str(e)}"
 
