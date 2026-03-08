@@ -182,7 +182,7 @@ def generate_flashcards(api_key, text_content, image_content, difficulty, count_
         
     try:
         response = client.models.generate_content(
-            model="gemini-2.0-flash", # Updated model name for best performance
+            model="gemini-2.5-flash-lite", # Updated model name for best performance
             contents=contents,
             config=types.GenerateContentConfig(
                 system_instruction=system_prompt,
