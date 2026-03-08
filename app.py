@@ -215,7 +215,7 @@ def generate_flashcards(api_key, content_input, difficulty, count_val, is_image=
         contents = [content_input] if is_image else [content_input]
 
         response = client.models.generate_content(
-            model="gemini-2.0-flash-exp", # Using latest fast model (multimodal)
+            model="gemini-2.5-flash-lite", # Using latest fast model (multimodal)
             contents=contents,
             config=types.GenerateContentConfig(
                 system_instruction=system_prompt,
