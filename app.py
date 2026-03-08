@@ -17,7 +17,7 @@ import io
 
 # ====================== 1. SAFE IMPORTS & CONFIGURATION ======================
 st.set_page_config(
-    page_title="Flashcard Library Pro v3.2", 
+    page_title="Flashcard Library Pro v3.3", 
     page_icon="🧠", 
     layout="wide",
     initial_sidebar_state="expanded"
@@ -418,7 +418,7 @@ def section_library():
     st.header("📚 Library & Exports")
     
     with get_db_connection() as conn:
-        df_cards = pd.read_sql("SELECT deck_id, ease_factor, repetitions, last_reviewed FROM cards", conn)
+        df_cards = pd.read_sql("SELECT id, deck_id, ease_factor, repetitions, last_reviewed FROM cards", conn)
         decks = pd.read_sql("SELECT id, name, created_at FROM decks", conn)
     
     if decks.empty:
@@ -428,12 +428,16 @@ def section_library():
     # 1. Deck Stats
     if not df_cards.empty:
         st.subheader("Deck Health")
-        df_merged = pd.merge(df_cards, decks, left_on="deck_id", right_on="id")
+        
+        # CRITICAL FIX: Explicit suffixes to prevent KeyErrors
+        df_merged = pd.merge(df_cards, decks, left_on="deck_id", right_on="id", suffixes=('_card', '_deck'))
+        
         deck_stats = df_merged.groupby("name").agg({
             "repetitions": "mean",
             "ease_factor": "mean",
-            "id_x": "count"
-        }).rename(columns={"id_x": "Total Cards", "repetitions": "Avg Reps", "ease_factor": "Avg Ease"})
+            "id_card": "count" # Use specific suffix column
+        }).rename(columns={"id_card": "Total Cards", "repetitions": "Avg Reps", "ease_factor": "Avg Ease"})
+        
         st.dataframe(deck_stats, use_container_width=True)
 
     # 2. Anki Export Section
@@ -499,7 +503,7 @@ def main():
         st.divider()
         page = st.radio("Navigation", ["Study Mode", "Generator", "Library & Exports"], label_visibility="collapsed")
         
-        st.caption("v3.2 - Anki Ready")
+        st.caption("v3.3 - Stable")
 
     if page == "Generator":
         section_generator(api_key)
@@ -510,4 +514,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
+                
