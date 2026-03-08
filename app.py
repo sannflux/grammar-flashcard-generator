@@ -1,554 +1,356 @@
 import streamlit as st
+import google.generativeai as genai
 import pandas as pd
-import tempfile
-import os
-import time
 import json
-import sqlite3
+import datetime
+import random
 import re
 import requests
-import math
-from datetime import datetime, timedelta
-from google import genai
-from google.genai import types
-from pydantic import BaseModel, Field
-from typing import List, Optional
 
-# ====================== 1. SAFE IMPORTS & CONFIGURATION ======================
-st.set_page_config(
-    page_title="Flashcard Library Pro v2.1", 
-    page_icon="🧠", 
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# --- ROBUST IMPORTS & ERROR HANDLING ---
+# We wrap optional dependencies in try/except blocks to prevent immediate crashes
+# and provide clear UI warnings instead.
 
-# Optional Dependencies (Graceful Degradation)
 try:
     from bs4 import BeautifulSoup
-    BS4_AVAILABLE = True
+    HAS_BS4 = True
 except ImportError:
-    BS4_AVAILABLE = False
+    HAS_BS4 = False
 
 try:
     from youtube_transcript_api import YouTubeTranscriptApi
-    YOUTUBE_AVAILABLE = True
+    HAS_YOUTUBE = True
 except ImportError:
-    YOUTUBE_AVAILABLE = False
+    HAS_YOUTUBE = False
 
-# Initialize Session State
-DEFAULT_STATE = {
-    "current_deck_id": None,
-    "study_queue": [],      # List of cards due for review
-    "study_index": 0,       # Current position in queue
-    "show_answer": False,
-    "session_stats": {"reviewed": 0, "correct": 0},
-    "processing": False,    # For UI locking during generation
-}
+try:
+    from PIL import Image
+    HAS_IMAGE = True
+except ImportError:
+    HAS_IMAGE = False
 
-for key, value in DEFAULT_STATE.items():
-    if key not in st.session_state:
-        st.session_state[key] = value
+# --- CONFIGURATION ---
+st.set_page_config(page_title="AI Flashcards Ultimate", page_icon="🧠", layout="wide")
 
-# ====================== 2. DATABASE ENGINE (Transactional & SM-2 Ready) ======================
-DB_NAME = "flashcards_v2.db"
+# --- SESSION STATE SETUP ---
+if "flashcards" not in st.session_state:
+    st.session_state.flashcards = []
+# Ensure a default 'next_review' exists for old cards without it
+for card in st.session_state.flashcards:
+    if "next_review" not in card:
+        card["next_review"] = datetime.date.today().isoformat()
+    if "box" not in card:
+        card["box"] = 1
 
-def get_db_connection():
-    """Returns a connection with row_factory set to sqlite3.Row"""
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    return conn
+if "current_card_index" not in st.session_state:
+    st.session_state.current_card_index = 0
+if "flipped" not in st.session_state:
+    st.session_state.flipped = False
+if "api_key_configured" not in st.session_state:
+    st.session_state.api_key_configured = False
 
-def init_db():
-    """Initialize the DB with Spaced Repetition fields."""
-    with get_db_connection() as conn:
-        c = conn.cursor()
-        
-        # Decks Table
-        c.execute('''CREATE TABLE IF NOT EXISTS decks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, 
-            name TEXT UNIQUE, 
-            description TEXT,
-            created_at TEXT
-        )''')
-        
-        # Cards Table with SM-2 Algorithm Fields
-        c.execute('''CREATE TABLE IF NOT EXISTS cards (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, 
-            deck_id INTEGER, 
-            front TEXT, 
-            back TEXT, 
-            tag TEXT,
-            ease_factor REAL DEFAULT 2.5,
-            interval INTEGER DEFAULT 0,
-            repetitions INTEGER DEFAULT 0,
-            next_review TEXT DEFAULT CURRENT_DATE,
-            FOREIGN KEY(deck_id) REFERENCES decks(id) ON DELETE CASCADE
-        )''')
-        conn.commit()
+# --- HELPER FUNCTIONS ---
 
-# Initialize on load
-init_db()
+def get_next_review_date(box_level):
+    """Calculates the next review date based on the Leitner box level."""
+    intervals = {1: 1, 2: 3, 3: 7, 4: 14, 5: 30}
+    days = intervals.get(box_level, 30)
+    return (datetime.date.today() + datetime.timedelta(days=days)).isoformat()
 
-# ====================== 3. CORE LOGIC: SPACED REPETITION (SM-2) ======================
-def update_card_sm2(card_id, quality):
-    """
-    Updates a card's schedule based on the SuperMemo-2 Algorithm.
-    Quality: 0 (Again/Fail), 3 (Hard), 4 (Good), 5 (Easy)
-    """
-    with get_db_connection() as conn:
-        c = conn.cursor()
-        c.execute("SELECT ease_factor, interval, repetitions FROM cards WHERE id=?", (card_id,))
-        row = c.fetchone()
-        
-        if row:
-            ease, interval, reps = row['ease_factor'], row['interval'], row['repetitions']
-            
-            if quality < 3:
-                # If user failed, reset repetitions and interval
-                reps = 0
-                interval = 1
-            else:
-                # Success path
-                if reps == 0:
-                    interval = 1
-                elif reps == 1:
-                    interval = 6
-                else:
-                    interval = math.ceil(interval * ease)
-                
-                reps += 1
-                # Adjust Ease Factor (standard SM-2 formula)
-                ease = ease + (0.1 - (5 - quality) * (0.08 + (5 - quality) * 0.02))
-                if ease < 1.3: ease = 1.3 # Minimum ease cap
-
-            # Calculate new review date
-            next_review_date = (datetime.now() + timedelta(days=interval)).strftime("%Y-%m-%d")
-
-            c.execute('''UPDATE cards 
-                         SET ease_factor=?, interval=?, repetitions=?, next_review=? 
-                         WHERE id=?''', 
-                      (ease, interval, reps, next_review_date, card_id))
-            conn.commit()
-
-# ====================== 4. CONTENT INGESTION ENGINE ======================
-class Flashcard(BaseModel):
-    front: str = Field(description="The question/concept. Plain text.")
-    back: str = Field(description="The answer. Use HTML <b> for key terms. No Markdown.")
-    tag: str = Field(description="A short category tag (e.g., 'History', 'Formula').")
-
-class FlashcardSet(BaseModel):
-    cards: List[Flashcard]
-
-def clean_text(text):
-    """Sanitize and standardize text."""
-    if not text: return ""
-    text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text) # MD Bold -> HTML
-    text = re.sub(r'\*(.*?)\*', r'<i>\1</i>', text)     # MD Italic -> HTML
-    return text.strip()
-
-@st.cache_data(show_spinner=False, ttl=3600)
-def fetch_youtube_transcript(url):
-    if not YOUTUBE_AVAILABLE:
-        return "Error: library 'youtube-transcript-api' not installed."
+def extract_json_from_text(text):
+    """ extracts JSON from markdown code blocks if present """
     try:
-        video_id = url.split("v=")[1].split("&")[0]
-        transcript = YouTubeTranscriptApi.get_transcript(video_id)
-        full_text = " ".join([t['text'] for t in transcript])
-        return full_text
-    except Exception as e:
-        return f"Error: Could not retrieve transcript. {str(e)}"
-
-@st.cache_data(show_spinner=False, ttl=3600)
-def fetch_web_content(url):
-    if not BS4_AVAILABLE:
-        return "Error: library 'beautifulsoup4' not installed."
-    
-    # 1. Impersonate a real browser (Chrome on Windows 10)
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.google.com/"
-    }
-    
-    try:
-        # 2. Add a Timeout (10 seconds max)
-        response = requests.get(url, headers=headers, timeout=10)
-        
-        # 3. Check for errors (403 Forbidden, 404 Not Found, etc.)
-        response.raise_for_status()
-        
-        soup = BeautifulSoup(response.content, 'html.parser')
-        
-        # 4. Remove junk elements
-        for script in soup(["script", "style", "nav", "footer", "header", "aside"]):
-            script.decompose()
-            
-        text = " ".join(soup.stripped_strings)
-        
-        # 5. Limit text length (to prevent Gemini context errors)
-        return text[:20000] 
-
-    except requests.exceptions.Timeout:
-        return "Error: The website took too long to respond. It might be blocking scrapers."
-    except requests.exceptions.HTTPError as e:
-        return f"Error: The website refused the connection ({e}). Try a different site."
-    except Exception as e:
-        return f"Error: Could not scrape website. {str(e)}"
-
-def generate_flashcards(api_key, content_text, difficulty, count_val):
-    client = genai.Client(api_key=api_key)
-    
-    system_prompt = f"""
-    Act as a professor for {difficulty} level students.
-    Create {count_val} flashcards based strictly on the user text.
-    
-    RULES:
-    1. Output JSON only.
-    2. 'back' field MUST use <b>bold</b> tags for keywords.
-    3. Keep questions concise and answers definitive.
-    """
-    
-    try:
-        response = client.models.generate_content(
-            model="gemini-2.5-flash-lite",
-            contents=[content_text],
-            config=types.GenerateContentConfig(
-                system_instruction=system_prompt,
-                response_mime_type="application/json",
-                response_schema=FlashcardSet,
-                temperature=0.3
-            )
-        )
-        return json.loads(response.text).get("cards", [])
-    except Exception as e:
-        st.error(f"AI Generation Failed: {e}")
+        # Try finding JSON inside ```json ... ``` or just [...]
+        match = re.search(r'\[.*\]', text, re.DOTALL)
+        if match:
+            return json.loads(match.group())
+        return json.loads(text)
+    except json.JSONDecodeError:
         return []
 
-# ====================== 5. UI COMPONENTS & CSS ======================
-def inject_custom_css():
-    st.markdown("""
-    <style>
-        /* Card Container */
-        .flashcard {
-            background-color: #ffffff;
-            border: 1px solid #e0e0e0;
-            border-radius: 15px;
-            padding: 40px;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.05);
-            min-height: 300px;
-            display: flex;
-            flex-direction: column;
-            justify-content: center;
-            align-items: center;
-            text-align: center;
-            transition: transform 0.2s;
+def fetch_youtube_transcript(url):
+    """Extracts transcript from a YouTube video."""
+    if not HAS_YOUTUBE:
+        return "Error: `youtube-transcript-api` is not installed."
+    
+    try:
+        video_id = url.split("v=")[-1].split("&")[0]
+        transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
+        text = " ".join([t['text'] for t in transcript_list])
+        return text
+    except Exception as e:
+        return f"Error fetching YouTube transcript: {str(e)}"
+
+def fetch_web_content(url):
+    """Scrapes text from a general website."""
+    if not HAS_BS4:
+        return "Error: `beautifulsoup4` is not installed."
+    
+    try:
+        # Added User-Agent to mimic a real browser and avoid 403 errors (e.g., Wikipedia)
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         }
-        .stApp[data-theme='dark'] .flashcard {
-            background-color: #262730;
-            border-color: #444;
-        }
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
         
-        /* Typography */
-        .card-front { font-size: 24px; font-weight: 700; color: #1f1f1f; margin-bottom: 20px; }
-        .stApp[data-theme='dark'] .card-front { color: #ffffff; }
+        soup = BeautifulSoup(response.text, 'html.parser')
         
-        .card-back { font-size: 20px; line-height: 1.6; color: #424242; }
-        .stApp[data-theme='dark'] .card-back { color: #e0e0e0; }
-        
-        .card-tag { 
-            background: #f0f2f6; color: #555; padding: 4px 10px; 
-            border-radius: 20px; font-size: 12px; font-weight: 600; text-transform: uppercase;
-            margin-bottom: 15px;
-        }
-        .stApp[data-theme='dark'] .card-tag { background: #333; color: #aaa; }
-        
-        /* Buttons */
-        .stButton>button { border-radius: 8px; font-weight: 600; }
-        
-        /* Hide Streamlit Branding */
-        #MainMenu {visibility: hidden;}
-        footer {visibility: hidden;}
-    </style>
-    """, unsafe_allow_html=True)
-
-# ====================== 6. APPLICATION SECTIONS ======================
-
-def section_generator(api_key):
-    st.header("🏭 Flashcard Factory")
-    
-    # 1. Source Selection
-    source_type = st.radio("Input Source", ["Text/Paste", "Upload PDF", "YouTube URL", "Web Article"], horizontal=True)
-    
-    content_text = ""
-    
-    if source_type == "Text/Paste":
-        content_text = st.text_area("Paste Notes Here", height=200)
-    
-    elif source_type == "Upload PDF":
-        uploaded_file = st.file_uploader("Upload PDF", type=["pdf"])
-        if uploaded_file:
-            st.info("💡 Pro Tip: For direct PDF analysis, ensure your API key supports Gemini 1.5 Pro.")
-            # Simplified text extraction placeholder
-            content_text = "Extract relevant concepts from this document."
+        # Kill all script and style elements
+        for script in soup(["script", "style", "nav", "footer", "header"]):
+            script.decompose()
             
-    elif source_type == "YouTube URL":
-        if not YOUTUBE_AVAILABLE:
-            st.warning("⚠️ 'youtube-transcript-api' is missing. Please install it to use this feature.")
+        text = soup.get_text(separator=' ')
+        
+        # Break into lines and remove leading and trailing space on each
+        lines = (line.strip() for line in text.splitlines())
+        # Break multi-headlines into a line each
+        chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+        # Drop blank lines
+        text = '\n'.join(chunk for chunk in chunks if chunk)
+        
+        return text[:15000] # Limit to 15k chars to save tokens
+    except Exception as e:
+        return f"Error scraping website: {str(e)}"
+
+def generate_flashcards(source_text, content_type="text"):
+    """Calls Gemini API to generate flashcards."""
+    if not st.session_state.api_key_configured:
+        st.error("Please configure your Gemini API Key first!")
+        return []
+
+    prompt = f"""
+    You are an expert tutor. Create a JSON list of flashcards based on the {content_type} provided below.
+    
+    The JSON structure must be:
+    [
+        {{"front": "Question or Concept", "back": "Answer or Explanation"}}
+    ]
+
+    - Focus on key concepts, definitions, and relationships.
+    - Keep answers concise (under 2 sentences).
+    - Create 5-10 cards.
+    - Return ONLY the raw JSON array. No markdown formatting.
+
+    Here is the {content_type}:
+    {source_text}
+    """
+
+    try:
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        
+        # Handling image vs text inputs
+        if content_type == "image":
+             # source_text is actually the PIL Image object here
+            response = model.generate_content([prompt, source_text])
         else:
-            url = st.text_input("Video URL")
-            if url:
-                with st.spinner("Transcribing Video..."):
-                    content_text = fetch_youtube_transcript(url)
-                    if "Error" not in content_text:
-                        st.success(f"Transcript loaded ({len(content_text)} chars)")
-                    else:
-                        st.error(content_text)
-                    
-    elif source_type == "Web Article":
-        if not BS4_AVAILABLE:
-            st.warning("⚠️ 'beautifulsoup4' is missing. Please install it to use this feature.")
-        else:
-            url = st.text_input("Article URL")
-            if url:
-                with st.spinner("Scraping Article..."):
-                    content_text = fetch_web_content(url)
-                    if "Error" not in content_text:
-                        st.success(f"Content loaded ({len(content_text)} chars)")
-                    else:
-                        st.error(content_text)
-
-    # 2. Settings
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        deck_name = st.text_input("Target Deck Name")
-    with col2:
-        difficulty = st.select_slider("Difficulty", ["Beginner", "Intermediate", "Expert"], value="Intermediate")
-    with col3:
-        qty = st.number_input("Card Count", min_value=1, max_value=50, value=10)
-
-    # 3. Generate
-    if st.button("🚀 Generate Cards", type="primary", use_container_width=True):
-        if not api_key:
-            st.error("Please provide an API Key in the sidebar.")
-            return
-
-        if not content_text or "Error" in content_text:
-            st.warning("Please provide valid content.")
-            return
-
-        with st.spinner("AI is crafting your study materials..."):
-            cards = generate_flashcards(api_key, content_text, difficulty, qty)
+            response = model.generate_content(prompt)
             
-            if cards and deck_name:
-                # Save to DB
-                with get_db_connection() as conn:
-                    c = conn.cursor()
-                    # Ensure Deck Exists
-                    c.execute("INSERT OR IGNORE INTO decks (name, created_at) VALUES (?, ?)", 
-                              (deck_name, datetime.now().strftime("%Y-%m-%d")))
-                    c.execute("SELECT id FROM decks WHERE name=?", (deck_name,))
-                    deck_id = c.fetchone()[0]
-                    
-                    # Insert Cards
-                    data = [(deck_id, clean_text(c['front']), clean_text(c['back']), c['tag']) for c in cards]
-                    c.executemany("INSERT INTO cards (deck_id, front, back, tag) VALUES (?, ?, ?, ?)", data)
-                    conn.commit()
-                
-                st.toast(f"🎉 Successfully created {len(cards)} cards in '{deck_name}'!", icon="✅")
-                time.sleep(1)
-                st.rerun()
+        return extract_json_from_text(response.text)
+    except Exception as e:
+        st.error(f"Gemini API Error: {str(e)}")
+        return []
 
-def section_study_mode():
-    st.header("🧘 Zen Study Mode")
-    
-    # 1. Deck Selector
-    with get_db_connection() as conn:
-        decks = conn.execute("SELECT id, name FROM decks").fetchall()
-    
-    if not decks:
-        st.info("Your library is empty. Go to the Generator to create a deck.")
-        return
-
-    deck_opts = {d['name']: d['id'] for d in decks}
-    selected_deck_name = st.selectbox("Select Deck", list(deck_opts.keys()))
-
-    deck_id = deck_opts[selected_deck_name]
-    
-    # 2. Load Queue (Only load if deck changed or queue empty)
-    if st.session_state["current_deck_id"] != deck_id:
-        st.session_state["current_deck_id"] = deck_id
-        # Logic: Fetch cards due today OR new cards
-        today = datetime.now().strftime("%Y-%m-%d")
-        with get_db_connection() as conn:
-            # Prioritize: Overdue > Due Today > New
-            q = """
-            SELECT * FROM cards 
-            WHERE deck_id = ? AND next_review <= ?
-            ORDER BY next_review ASC, id ASC
-            LIMIT 50
-            """
-            cards = conn.execute(q, (deck_id, today)).fetchall()
-            st.session_state["study_queue"] = [dict(c) for c in cards] # Convert rows to dicts
-            st.session_state["study_index"] = 0
-            st.session_state["show_answer"] = False
-            st.session_state["session_stats"] = {"reviewed": 0, "correct": 0}
-
-    queue = st.session_state["study_queue"]
-    idx = st.session_state["study_index"]
-
-    # 3. Empty State
-    if not queue:
-        st.success("🎉 You are all caught up on this deck for today!")
-        st.balloons()
-        if st.button("Study Ahead (Review All Cards)", type="secondary"):
-             with get_db_connection() as conn:
-                cards = conn.execute("SELECT * FROM cards WHERE deck_id = ?", (deck_id,)).fetchall()
-                st.session_state["study_queue"] = [dict(c) for c in cards]
-                st.rerun()
-        return
-
-    # 4. Display Card
-    if idx < len(queue):
-        card = queue[idx]
-        
-        # Progress Bar
-        progress = (idx) / len(queue)
-        st.progress(progress, text=f"Card {idx+1} of {len(queue)}")
-
-        # Card Container
-        with st.container():
-            st.markdown(f"""
-            <div class="flashcard">
-                <div class="card-tag">{card['tag']}</div>
-                <div class="card-front">{card['front']}</div>
-                {"<hr style='opacity:0.2; width:80%'>" if st.session_state["show_answer"] else ""}
-                <div class="card-back">
-                    {card['back'] if st.session_state["show_answer"] else "<span style='color:#ccc; font-style:italic'>(Think about the answer...)</span>"}
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-
-        st.write("") # Spacer
-
-        # Interaction Controls
-        if not st.session_state["show_answer"]:
-            col_rev, col_skip = st.columns([4, 1])
-            with col_rev:
-                if st.button("👁️ Show Answer (Spacebar)", type="primary", use_container_width=True):
-                    st.session_state["show_answer"] = True
-                    st.rerun()
-        else:
-            st.write("### How well did you know this?")
-            c1, c2, c3, c4 = st.columns(4)
-            
-            def handle_rating(quality):
-                update_card_sm2(card['id'], quality)
-                st.session_state["session_stats"]["reviewed"] += 1
-                if quality >= 3:
-                    st.session_state["session_stats"]["correct"] += 1
-                
-                # Advance Queue
-                st.session_state["study_index"] += 1
-                st.session_state["show_answer"] = False
-                st.rerun()
-
-            with c1: 
-                if st.button("🔴 Again", use_container_width=True): handle_rating(0)
-            with c2: 
-                if st.button("🟠 Hard", use_container_width=True): handle_rating(3)
-            with c3: 
-                if st.button("🟢 Good", use_container_width=True): handle_rating(4)
-            with c4: 
-                if st.button("🔵 Easy", use_container_width=True): handle_rating(5)
-    else:
-        # End of session
-        st.success("Session Complete!")
-        stats = st.session_state["session_stats"]
-        acc = int((stats["correct"] / stats["reviewed"] * 100)) if stats["reviewed"] > 0 else 0
-        st.metric("Retention Rate", f"{acc}%", f"{stats['reviewed']} Cards Reviewed")
-        if st.button("Start Over"):
-            st.session_state["study_index"] = 0
-            st.rerun()
-
-def section_library():
-    st.header("📚 Library Management")
-    
-    with get_db_connection() as conn:
-        decks = conn.execute("SELECT * FROM decks ORDER BY created_at DESC").fetchall()
-    
-    if not decks:
-        st.info("No decks found.")
-        return
-
-    # Deck Statistics
-    deck_data = []
-    for d in decks:
-        with get_db_connection() as conn:
-            count = conn.execute("SELECT COUNT(*) FROM cards WHERE deck_id=?", (d['id'],)).fetchone()[0]
-            due = conn.execute("SELECT COUNT(*) FROM cards WHERE deck_id=? AND next_review <= ?", 
-                               (d['id'], datetime.now().strftime("%Y-%m-%d"))).fetchone()[0]
-            deck_data.append({
-                "ID": d['id'],
-                "Deck Name": d['name'], 
-                "Total Cards": count, 
-                "Due Today": due,
-                "Created": d['created_at']
-            })
-    
-    df = pd.DataFrame(deck_data)
-    st.dataframe(df, use_container_width=True, hide_index=True)
-
-    # Deck Operations
-    st.divider()
-    c1, c2 = st.columns(2)
-    with c1:
-        st.subheader("🗑️ Delete Deck")
-        del_deck = st.selectbox("Choose deck to delete", [d['name'] for d in decks])
-        if st.button("Delete Permanently"):
-            with get_db_connection() as conn:
-                conn.execute("DELETE FROM decks WHERE name=?", (del_deck,))
-                conn.commit()
-            st.toast(f"Deleted {del_deck}")
-            time.sleep(1)
-            st.rerun()
-            
-    with c2:
-        st.subheader("📥 Export to CSV")
-        exp_deck = st.selectbox("Choose deck to export", [d['name'] for d in decks])
-        if st.button("Generate CSV"):
-             with get_db_connection() as conn:
-                deck_id = conn.execute("SELECT id FROM decks WHERE name=?", (exp_deck,)).fetchone()[0]
-                cards = conn.execute("SELECT front, back, tag FROM cards WHERE deck_id=?", (deck_id,)).fetchall()
-                
-                # Format for Anki Import
-                # Anki expects HTML in fields, so our 'back' field is already compatible
-                csv_data = pd.DataFrame([dict(c) for c in cards]).to_csv(index=False, header=False, sep="\t")
-                st.download_button("Download for Anki (.txt)", csv_data, f"{exp_deck}_anki.txt", "text/csv")
-                st.info("Import this into Anki using 'Tab-separated' settings. Allow HTML in fields.")
-
-# ====================== 7. MAIN APP LAYOUT ======================
-inject_custom_css()
-
+# --- SIDEBAR: SETTINGS & INPUTS ---
 with st.sidebar:
-    st.title("🧠 Flashcard Pro")
+    st.header("⚙️ Settings")
     
-    # Navigation
-    nav = st.radio("Navigation", ["Study Mode", "Generator", "Library"], index=0)
-    
-    st.divider()
-    
-    # API Key Management
-    api_key = st.text_input("Gemini API Key", type="password", value=os.environ.get("GEMINI_API_KEY", ""))
-    if not api_key:
-        st.warning("API Key required for generation.")
-        
-    st.divider()
-    st.caption(f"v2.1.0 | DB: {DB_NAME}")
+    api_key = st.text_input("Gemini API Key", type="password")
+    if api_key:
+        genai.configure(api_key=api_key)
+        st.session_state.api_key_configured = True
+        st.success("API Key Active ✅")
+    else:
+        st.warning("Enter API Key to start.")
 
-# Routing
-if nav == "Study Mode":
-    section_study_mode()
-elif nav == "Generator":
-    section_generator(api_key)
-elif nav == "Library":
-    section_library()
+    st.markdown("---")
+    st.header("📥 Create Cards")
+    
+    input_method = st.radio("Source:", ["Text / Notes", "Image / Screenshot", "YouTube URL", "Web Article URL"])
+    
+    source_content = None
+    process_button = False
+
+    if input_method == "Text / Notes":
+        source_content = st.text_area("Paste your notes here:", height=150)
+        process_button = st.button("Generate from Text")
+
+    elif input_method == "Image / Screenshot":
+        if HAS_IMAGE:
+            uploaded_file = st.file_uploader("Upload an image of your notes", type=["jpg", "png", "jpeg"])
+            if uploaded_file:
+                image = Image.open(uploaded_file)
+                st.image(image, caption="Uploaded Notes", use_container_width=True)
+                source_content = image # We pass the object directly
+                process_button = st.button("Generate from Image")
+        else:
+            st.error("⚠️ Pillow (PIL) library missing. Please add `Pillow` to requirements.txt")
+
+    elif input_method == "YouTube URL":
+        if HAS_YOUTUBE:
+            url_input = st.text_input("Paste YouTube Link:")
+            if url_input:
+                process_button = st.button("Generate from Video")
+                if process_button:
+                    with st.spinner("Transcribing video..."):
+                        source_content = fetch_youtube_transcript(url_input)
+                        if "Error" in source_content:
+                            st.error(source_content)
+                            source_content = None
+        else:
+            st.error("⚠️ `youtube-transcript-api` missing. Add it to requirements.txt")
+
+    elif input_method == "Web Article URL":
+        if HAS_BS4:
+            url_input = st.text_input("Paste Article Link:")
+            if url_input:
+                process_button = st.button("Generate from Article")
+                if process_button:
+                    with st.spinner("Scraping website..."):
+                        source_content = fetch_web_content(url_input)
+                        if "Error" in source_content:
+                            st.error(source_content)
+                            source_content = None
+        else:
+            st.error("⚠️ `beautifulsoup4` or `requests` missing. Add them to requirements.txt")
+
+    if process_button and source_content:
+        with st.spinner("AI is thinking..."):
+            # Determine content type string for the prompt
+            ctype = "image" if input_method == "Image / Screenshot" else "text"
+            
+            new_cards = generate_flashcards(source_content, content_type=ctype)
+            
+            if new_cards:
+                # Add default Leitner fields
+                for card in new_cards:
+                    card['box'] = 1
+                    card['next_review'] = datetime.date.today().isoformat()
+                    
+                st.session_state.flashcards.extend(new_cards)
+                st.success(f"Generated {len(new_cards)} new cards!")
+                st.rerun()
+
+    st.markdown("---")
+    st.metric("Total Cards", len(st.session_state.flashcards))
+    if st.button("Clear All Cards"):
+        st.session_state.flashcards = []
+        st.rerun()
+
+# --- MAIN AREA: REVIEW SYSTEM ---
+st.title("🧠 AI Spaced Repetition Flashcards")
+
+# Filter cards for today
+today_str = datetime.date.today().isoformat()
+due_cards = [
+    (i, card) for i, card in enumerate(st.session_state.flashcards) 
+    if card['next_review'] <= today_str
+]
+
+if not due_cards:
+    st.info("🎉 You're all caught up! No cards due for review today.")
+    
+    if len(st.session_state.flashcards) > 0:
+        with st.expander("View All Cards (Cheat Sheet)"):
+            df = pd.DataFrame(st.session_state.flashcards)
+            st.dataframe(df[['front', 'back', 'box', 'next_review']])
+else:
+    # Get current card data
+    # We use a session index to track which *due card* we are looking at
+    # Ensure index is within bounds of due_cards list
+    if st.session_state.current_card_index >= len(due_cards):
+        st.session_state.current_card_index = 0
+        
+    original_index, card_data = due_cards[st.session_state.current_card_index]
+
+    st.markdown(f"**Reviewing Card {st.session_state.current_card_index + 1} of {len(due_cards)}**")
+    
+    # Progress Bar
+    progress = (st.session_state.current_card_index) / len(due_cards)
+    st.progress(progress)
+
+    # Card Display UI
+    card_container = st.container(border=True)
+    
+    with card_container:
+        card_height = 300
+        # CSS to center text vertically and horizontally
+        st.markdown(
+            f"""
+            <div style="
+                height: {card_height}px; 
+                display: flex; 
+                justify-content: center; 
+                align-items: center; 
+                text-align: center; 
+                font-size: 24px; 
+                font-weight: bold;
+                background-color: #f0f2f6;
+                border-radius: 10px;
+                color: #31333F;
+                padding: 20px;
+            ">
+                {card_data['back'] if st.session_state.flipped else card_data['front']}
+            </div>
+            """, 
+            unsafe_allow_html=True
+        )
+
+    # Interaction Buttons
+    col1, col2, col3 = st.columns([1, 2, 1])
+    
+    with col2:
+        if not st.session_state.flipped:
+            if st.button("Show Answer", use_container_width=True):
+                st.session_state.flipped = True
+                st.rerun()
+        else:
+            # Rating Buttons
+            st.markdown("### How was it?")
+            b1, b2, b3 = st.columns(3)
+            
+            with b1:
+                if st.button("❌ Hard / Forgot", use_container_width=True):
+                    # Reset to Box 1
+                    st.session_state.flashcards[original_index]['box'] = 1
+                    st.session_state.flashcards[original_index]['next_review'] = get_next_review_date(1)
+                    
+                    st.session_state.flipped = False
+                    # Move to next due card (or loop)
+                    if st.session_state.current_card_index < len(due_cards) - 1:
+                        st.session_state.current_card_index += 1
+                    else:
+                        st.session_state.current_card_index = 0
+                    st.rerun()
+            
+            with b2:
+                if st.button("🆗 Good", use_container_width=True):
+                    # Remain in same box (or slight bump? Standard Leitner usually bumps up)
+                    # Let's bump box +1
+                    current_box = st.session_state.flashcards[original_index]['box']
+                    new_box = min(current_box + 1, 5)
+                    st.session_state.flashcards[original_index]['box'] = new_box
+                    st.session_state.flashcards[original_index]['next_review'] = get_next_review_date(new_box)
+
+                    st.session_state.flipped = False
+                    if st.session_state.current_card_index < len(due_cards) - 1:
+                        st.session_state.current_card_index += 1
+                    else:
+                        st.session_state.current_card_index = 0
+                    st.rerun()
+
+            with b3:
+                if st.button("✅ Easy", use_container_width=True):
+                    # Jump 2 boxes (Bonus)
+                    current_box = st.session_state.flashcards[original_index]['box']
+                    new_box = min(current_box + 2, 5)
+                    st.session_state.flashcards[original_index]['box'] = new_box
+                    st.session_state.flashcards[original_index]['next_review'] = get_next_review_date(new_box)
+                    
+                    st.session_state.flipped = False
+                    if st.session_state.current_card_index < len(due_cards) - 1:
+                        st.session_state.current_card_index += 1
+                    else:
+                        st.session_state.current_card_index = 0
+                    st.rerun()
+
