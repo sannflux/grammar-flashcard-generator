@@ -1,6 +1,6 @@
 streamlit
 pandas
-google-genai
+google-generativeai
 pydantic
 beautifulsoup4
 youtube-transcript-api
