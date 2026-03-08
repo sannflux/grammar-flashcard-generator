@@ -17,7 +17,7 @@ import io
 
 # ====================== 1. SAFE IMPORTS & CONFIGURATION ======================
 st.set_page_config(
-    page_title="Flashcard Library Pro v3.3", 
+    page_title="Flashcard Library Pro v3.5", 
     page_icon="🧠", 
     layout="wide",
     initial_sidebar_state="expanded"
@@ -429,13 +429,13 @@ def section_library():
     if not df_cards.empty:
         st.subheader("Deck Health")
         
-        # CRITICAL FIX: Explicit suffixes to prevent KeyErrors
+        # Explicit suffixes to prevent KeyErrors
         df_merged = pd.merge(df_cards, decks, left_on="deck_id", right_on="id", suffixes=('_card', '_deck'))
         
         deck_stats = df_merged.groupby("name").agg({
             "repetitions": "mean",
             "ease_factor": "mean",
-            "id_card": "count" # Use specific suffix column
+            "id_card": "count"
         }).rename(columns={"id_card": "Total Cards", "repetitions": "Avg Reps", "ease_factor": "Avg Ease"})
         
         st.dataframe(deck_stats, use_container_width=True)
@@ -448,22 +448,35 @@ def section_library():
     with col_exp:
         export_deck_name = st.selectbox("Select Deck to Export", decks['name'].tolist())
         
+        # Initialize Variables
+        csv_data = None
+        clean_filename = "anki_deck.csv"
+        
         if export_deck_name:
+            # Sanitize filename (Fixes "Download Failed")
+            clean_filename = re.sub(r'[^a-zA-Z0-9]', '_', export_deck_name) + "_anki.csv"
+            
             # Fetch Cards for export
             deck_id = decks[decks['name'] == export_deck_name].iloc[0]['id']
             with get_db_connection() as conn:
                 cards_df = pd.read_sql("SELECT front, back, tag FROM cards WHERE deck_id=?", conn, params=(deck_id,))
             
-            # Convert to CSV
-            csv = cards_df.to_csv(index=False, header=False).encode('utf-8')
+            # Convert to CSV if cards exist
+            if not cards_df.empty:
+                csv_data = cards_df.to_csv(index=False, header=False).encode('utf-8')
+            else:
+                st.warning("Selected deck has no cards.")
             
-            st.download_button(
-                label="Download Anki CSV",
-                data=csv,
-                file_name=f"{export_deck_name}_anki.csv",
-                mime="text/csv",
-                help="Import this file into Anki. It contains Front, Back, and Tags."
-            )
+        # The download button now has data ready immediately
+        st.download_button(
+            label="Download Anki CSV",
+            data=csv_data if csv_data else b"Error: Empty Deck", 
+            file_name=clean_filename,
+            mime="text/csv",
+            disabled=(csv_data is None), # Disable if no data
+            key=f"dl_btn_{clean_filename}", # Unique Key (Fixes State Loss)
+            help="Import this file into Anki. It contains Front, Back, and Tags."
+        )
 
     with col_info:
         st.info("""
@@ -499,19 +512,4 @@ def main():
         api_key = st.text_input("Gemini API Key", type="password")
         if not api_key:
             st.warning("Enter API Key to generate.")
-            
-        st.divider()
-        page = st.radio("Navigation", ["Study Mode", "Generator", "Library & Exports"], label_visibility="collapsed")
-        
-        st.caption("v3.3 - Stable")
-
-    if page == "Generator":
-        section_generator(api_key)
-    elif page == "Study Mode":
-        section_study()
-    elif page == "Library & Exports":
-        section_library()
-
-if __name__ == "__main__":
-    main()
-                            
+         
