@@ -17,7 +17,7 @@ import io
 
 # ====================== 1. SAFE IMPORTS & CONFIGURATION ======================
 st.set_page_config(
-    page_title="Flashcard Library Pro v4.0", 
+    page_title="Flashcard Library Pro v4.1", 
     page_icon="🧠", 
     layout="wide",
     initial_sidebar_state="expanded"
@@ -501,7 +501,7 @@ def section_library():
     tab1, tab2, tab3 = st.tabs(["📊 Stats", "📤 Export", "🗑️ Manage Decks"])
 
     with tab1:
-        if notdf_cards.empty:
+        if not df_cards.empty: # FIXED TYPO HERE
             st.subheader("Deck Health")
             df_merged = pd.merge(df_cards, decks, left_on="deck_id", right_on="id", suffixes=('_card', '_deck'))
             
@@ -539,7 +539,8 @@ def section_library():
             
             if export_deck_name:
                 clean_filename = re.sub(r'[^a-zA-Z0-9]', '_', export_deck_name) + "_anki.csv"
-                deck_id = int(decks[decks['name'] == export_deck_name].iloc[0]['id'])
+                deck_id_raw = decks[decks['name'] == export_deck_name].iloc[0]['id']
+                deck_id = int(deck_id_raw)
                 
                 with get_db_connection() as conn:
                     cards_df = pd.read_sql("SELECT front, back, tag FROM cards WHERE deck_id=?", conn, params=(deck_id,))
@@ -581,7 +582,7 @@ def main():
         st.divider()
         page = st.radio("Navigation", ["Study Mode", "Generator", "Library & Stats"], label_visibility="collapsed")
         
-        st.caption("v4.0 - Mobile Ready")
+        st.caption("v4.1 - Mobile Ready")
 
     if page == "Generator":
         section_generator(api_key)
@@ -591,4 +592,4 @@ def main():
         section_library()
 
 if __name__ == "__main__":
-    main()
+    main() to see stat
