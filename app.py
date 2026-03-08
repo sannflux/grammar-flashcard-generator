@@ -512,4 +512,18 @@ def main():
         api_key = st.text_input("Gemini API Key", type="password")
         if not api_key:
             st.warning("Enter API Key to generate.")
-         
+            
+        st.divider()
+        page = st.radio("Navigation", ["Study Mode", "Generator", "Library & Exports"], label_visibility="collapsed")
+        
+        st.caption("v3.5 - Stable")
+
+    if page == "Generator":
+        section_generator(api_key)
+    elif page == "Study Mode":
+        section_study()
+    elif page == "Library & Exports":
+        section_library()
+
+if __name__ == "__main__":
+    main()
