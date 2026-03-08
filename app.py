@@ -17,7 +17,7 @@ import io
 
 # ====================== 1. SAFE IMPORTS & CONFIGURATION ======================
 st.set_page_config(
-    page_title="Flashcard Library Pro v3.0", 
+    page_title="Flashcard Library Pro v3.1", 
     page_icon="🧠", 
     layout="wide",
     initial_sidebar_state="expanded"
@@ -43,14 +43,14 @@ DEFAULT_STATE = {
     "study_index": 0,       
     "show_answer": False,
     "session_stats": {"reviewed": 0, "correct": 0},
-    "cram_mode": False,     # New: Ignore scheduling
+    "cram_mode": False,
 }
 
 for key, value in DEFAULT_STATE.items():
     if key not in st.session_state:
         st.session_state[key] = value
 
-# ====================== 2. DATABASE ENGINE (WAL Mode & Migrations) ======================
+# ====================== 2. DATABASE ENGINE (WAL Mode) ======================
 DB_NAME = "flashcards_v3.db"
 
 def get_db_connection():
@@ -60,10 +60,9 @@ def get_db_connection():
     return conn
 
 def init_db():
-    """Initialize DB with WAL mode for concurrency and migrations."""
+    """Initialize DB with WAL mode."""
     with get_db_connection() as conn:
         c = conn.cursor()
-        # Enable Write-Ahead Logging for better concurrency in Streamlit
         c.execute("PRAGMA journal_mode=WAL;")
         
         c.execute('''CREATE TABLE IF NOT EXISTS decks (
@@ -88,13 +87,12 @@ def init_db():
             FOREIGN KEY(deck_id) REFERENCES decks(id) ON DELETE CASCADE
         )''')
         
-        # Migration: Check if 'explanation' exists (for upgrades from v2)
+        # Migrations for existing DBs
         try:
             c.execute("SELECT explanation FROM cards LIMIT 1")
         except sqlite3.OperationalError:
             c.execute("ALTER TABLE cards ADD COLUMN explanation TEXT DEFAULT ''")
         
-        # Migration: Check if 'last_reviewed' exists
         try:
             c.execute("SELECT last_reviewed FROM cards LIMIT 1")
         except sqlite3.OperationalError:
@@ -106,7 +104,6 @@ init_db()
 
 # ====================== 3. CORE LOGIC: SPACED REPETITION (SM-2) ======================
 def update_card_sm2(card_id, quality):
-    """Updates a card's schedule based on the SuperMemo-2 Algorithm."""
     with get_db_connection() as conn:
         c = conn.cursor()
         c.execute("SELECT ease_factor, interval, repetitions FROM cards WHERE id=?", (card_id,))
@@ -139,7 +136,7 @@ def update_card_sm2(card_id, quality):
                       (ease, interval, reps, next_review, last_reviewed, card_id))
             conn.commit()
 
-# ====================== 4. AI CONTENT ENGINE (Multimodal & Robust) ======================
+# ====================== 4. AI CONTENT ENGINE ======================
 class Flashcard(BaseModel):
     front: str = Field(description="The question/concept. Plain text.")
     back: str = Field(description="The answer. Use HTML <b> for key terms.")
@@ -151,12 +148,10 @@ class FlashcardSet(BaseModel):
 
 def clean_text(text):
     if not text: return ""
-    # Support LaTeX markers if present, otherwise standard cleaning
     text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text) 
     return text.strip()
 
 def sanitize_json(text):
-    """Strips Markdown code blocks from LLM response."""
     text = re.sub(r'^```json', '', text, flags=re.MULTILINE)
     text = re.sub(r'^```', '', text, flags=re.MULTILINE)
     return text.strip()
@@ -178,11 +173,12 @@ def generate_flashcards(api_key, text_content, image_content, difficulty, count_
     if text_content:
         contents.append(text_content)
     if image_content:
-        contents.append(image_content) # Pass PIL Image directly to Gemini
+        contents.append(image_content)
         
     try:
+        # STRICT MODEL CONSTRAINT: gemini-2.5-flash-lite
         response = client.models.generate_content(
-            model="gemini-2.5-flash-lite", # Updated model name for best performance
+            model="gemini-2.5-flash-lite", 
             contents=contents,
             config=types.GenerateContentConfig(
                 system_instruction=system_prompt,
@@ -191,7 +187,6 @@ def generate_flashcards(api_key, text_content, image_content, difficulty, count_
                 temperature=0.3
             )
         )
-        # Robust Parsing
         clean_json = sanitize_json(response.text)
         return json.loads(clean_json).get("cards", [])
     except Exception as e:
@@ -339,17 +334,15 @@ def section_study():
             st.session_state["current_deck_id"] = None # Force reload
             st.rerun()
 
-    # Load Queue Logic
+    # Load Queue
     if st.session_state["current_deck_id"] != deck_id:
         st.session_state["current_deck_id"] = deck_id
         
         with get_db_connection() as conn:
             if st.session_state["cram_mode"]:
-                # Load ALL cards shuffled
                 q = "SELECT * FROM cards WHERE deck_id = ? ORDER BY RANDOM() LIMIT 50"
                 cards = conn.execute(q, (deck_id,)).fetchall()
             else:
-                # Load Scheduled cards
                 today = datetime.now().strftime("%Y-%m-%d")
                 q = "SELECT * FROM cards WHERE deck_id = ? AND next_review <= ? ORDER BY next_review ASC LIMIT 50"
                 cards = conn.execute(q, (deck_id, today)).fetchall()
@@ -370,18 +363,23 @@ def section_study():
         card = queue[idx]
         st.progress((idx + 1) / len(queue), text=f"Card {idx+1}/{len(queue)}")
         
+        # HTML Content Preparation to fix rendering bugs
+        back_content = card['back'] if st.session_state["show_answer"] else "<span style='color:#ccc; font-style:italic'>(Think...)</span>"
+        explanation_html = ""
+        if st.session_state["show_answer"] and card.get("explanation"):
+            explanation_html = f'<div class="card-explanation">💡 {card["explanation"]}</div>'
+
         with st.container():
-            st.markdown(f"""
+            # FIXED: Broken down into cleaner f-string to ensure HTML renders
+            html_code = f"""
             <div class="flashcard">
                 <div class="card-tag">{card['tag']}</div>
                 <div class="card-front">{card['front']}</div>
-                {"<hr style='width:50%; opacity:0.3'>" if st.session_state["show_answer"] else ""}
-                <div class="card-back">
-                    {card['back'] if st.session_state["show_answer"] else "<span style='color:#ccc; font-style:italic'>(Think...)</span>"}
-                </div>
-                {f'<div class="card-explanation">💡 {card["explanation"]}</div>' if st.session_state["show_answer"] and card.get("explanation") else ""}
+                <div class="card-back">{back_content}</div>
+                {explanation_html}
             </div>
-            """, unsafe_allow_html=True)
+            """
+            st.markdown(html_code, unsafe_allow_html=True)
 
         st.write("") 
         
@@ -416,42 +414,77 @@ def section_study():
             st.session_state["current_deck_id"] = None
             st.rerun()
 
-def section_stats():
-    st.header("📊 Progress Analytics")
+def section_library():
+    st.header("📚 Library & Exports")
     
     with get_db_connection() as conn:
-        # Retention Stats
         df_cards = pd.read_sql("SELECT deck_id, ease_factor, repetitions, last_reviewed FROM cards", conn)
-        decks = pd.read_sql("SELECT id, name FROM decks", conn)
+        decks = pd.read_sql("SELECT id, name, created_at FROM decks", conn)
     
-    if df_cards.empty:
-        st.info("No study data yet.")
+    if decks.empty:
+        st.info("No decks found.")
         return
 
-    # 1. Deck Overview
-    st.subheader("Deck Health")
-    df_merged = pd.merge(df_cards, decks, left_on="deck_id", right_on="id")
-    deck_stats = df_merged.groupby("name").agg({
-        "repetitions": "mean",
-        "ease_factor": "mean",
-        "id_x": "count"
-    }).rename(columns={"id_x": "Total Cards", "repetitions": "Avg Reps", "ease_factor": "Avg Ease"})
+    # 1. Deck Stats
+    if not df_cards.empty:
+        st.subheader("Deck Health")
+        df_merged = pd.merge(df_cards, decks, left_on="deck_id", right_on="id")
+        deck_stats = df_merged.groupby("name").agg({
+            "repetitions": "mean",
+            "ease_factor": "mean",
+            "id_x": "count"
+        }).rename(columns={"id_x": "Total Cards", "repetitions": "Avg Reps", "ease_factor": "Avg Ease"})
+        st.dataframe(deck_stats, use_container_width=True)
+
+    # 2. Anki Export Section
+    st.divider()
+    st.subheader("📤 Export to Anki")
+    col_exp, col_info = st.columns([1, 2])
     
-    st.dataframe(deck_stats, use_container_width=True)
-    
-    # 2. Activity Heatmap
-    st.subheader("Study Activity")
-    df_cards['last_reviewed'] = pd.to_datetime(df_cards['last_reviewed']).dt.date
-    activity = df_cards['last_reviewed'].value_counts().reset_index()
-    activity.columns = ['date', 'count']
-    
-    chart = alt.Chart(activity).mark_rect().encode(
-        x=alt.X('date:O', title="Date"),
-        y=alt.Y('count:Q', title="Cards Reviewed"),
-        color=alt.Color('count', scale=alt.Scale(scheme='greens'))
-    ).properties(height=200)
-    
-    st.altair_chart(chart, use_container_width=True)
+    with col_exp:
+        export_deck_name = st.selectbox("Select Deck to Export", decks['name'].tolist())
+        
+        if export_deck_name:
+            # Fetch Cards for export
+            deck_id = decks[decks['name'] == export_deck_name].iloc[0]['id']
+            with get_db_connection() as conn:
+                cards_df = pd.read_sql("SELECT front, back, tag FROM cards WHERE deck_id=?", conn, params=(deck_id,))
+            
+            # Convert to CSV
+            csv = cards_df.to_csv(index=False, header=False).encode('utf-8')
+            
+            st.download_button(
+                label="Download Anki CSV",
+                data=csv,
+                file_name=f"{export_deck_name}_anki.csv",
+                mime="text/csv",
+                help="Import this file into Anki. It contains Front, Back, and Tags."
+            )
+
+    with col_info:
+        st.info("""
+        **How to Import into Anki:**
+        1. Download the CSV.
+        2. Open Anki -> File -> Import.
+        3. Select the file.
+        4. Ensure 'Field Separator' is Comma.
+        5. Map fields: Field 1 -> Front, Field 2 -> Back, Field 3 -> Tags.
+        """)
+
+    # 3. Heatmap
+    if not df_cards.empty and df_cards['last_reviewed'].notna().any():
+        st.divider()
+        st.subheader("Study Activity")
+        df_cards['last_reviewed'] = pd.to_datetime(df_cards['last_reviewed']).dt.date
+        activity = df_cards['last_reviewed'].value_counts().reset_index()
+        activity.columns = ['date', 'count']
+        
+        chart = alt.Chart(activity).mark_rect().encode(
+            x=alt.X('date:O', title="Date"),
+            y=alt.Y('count:Q', title="Cards Reviewed"),
+            color=alt.Color('count', scale=alt.Scale(scheme='greens'))
+        ).properties(height=200)
+        st.altair_chart(chart, use_container_width=True)
 
 # ====================== 7. MAIN NAVIGATION ======================
 def main():
@@ -464,17 +497,16 @@ def main():
             st.warning("Enter API Key to generate.")
             
         st.divider()
-        page = st.radio("Navigation", ["Study Mode", "Generator", "Library & Stats"], label_visibility="collapsed")
+        page = st.radio("Navigation", ["Study Mode", "Generator", "Library & Exports"], label_visibility="collapsed")
         
-        st.info("v3.0 - Lead Engineer Edition")
+        st.caption("v3.1 - Anki Ready")
 
     if page == "Generator":
         section_generator(api_key)
     elif page == "Study Mode":
         section_study()
-    elif page == "Library & Stats":
-        section_stats()
+    elif page == "Library & Exports":
+        section_librrary()
 
 if __name__ == "__main__":
     main()
-                                                                      
