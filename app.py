@@ -465,17 +465,42 @@ def section_settings():
 
 # ====================== 7. MAIN APP LOOP ======================
 def main():
-    # Sidebar Navigation
+    # --- Sidebar Configuration ---
     st.sidebar.title("🧠 Flashcard Pro")
     
-    # API Key Status
-    if st.session_state.get("api_key"):
-        st.sidebar.success("🔑 API Key Active")
-    else:
-        st.sidebar.warning("⚠️ No API Key")
-        
-    menu = st.sidebar.radio("Navigation", ["Study Mode", "Generator", "Library", "Settings"])
+    # 1. API Key Logic (Always visible if missing)
+    api_key = st.session_state.get("api_key", "")
     
+    if not api_key:
+        st.sidebar.warning("⚠️ API Key Missing")
+        entered_key = st.sidebar.text_input("Enter Gemini API Key", type="password", key="sidebar_api_input")
+        if st.sidebar.button("Save Key"):
+            save_settings("api_key", entered_key)
+            st.session_state["api_key"] = entered_key
+            st.sidebar.success("Saved! Reloading...")
+            time.sleep(1)
+            st.rerun()
+    else:
+        st.sidebar.success("🔑 API Key Active")
+        if st.sidebar.button("Clear Key", type="secondary"):
+            save_settings("api_key", "")
+            st.session_state["api_key"] = ""
+            st.rerun()
+
+    st.sidebar.divider()
+
+    # 2. Navigation
+    # Default to Generator if no cards exist, otherwise Study Mode
+    if "menu_selection" not in st.session_state:
+        st.session_state["menu_selection"] = "Generator"
+
+    menu = st.sidebar.radio(
+        "Navigation", 
+        ["Study Mode", "Generator", "Library", "Settings"],
+        index=1 # Defaults to Generator for first run
+    )
+    
+    # 3. Page Routing
     if menu == "Study Mode":
         section_study_mode()
     elif menu == "Generator":
@@ -487,4 +512,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-                
