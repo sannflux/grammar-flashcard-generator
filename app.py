@@ -82,16 +82,47 @@ def get_youtube_transcript(url):
     except Exception as e:
         return None, str(e)
 
+# ====================== UPDATED HELPER FUNCTIONS ======================
+
 def get_website_text(url):
     try:
-        response = requests.get(url)
+        # 1. Pretend to be a real browser (User-Agent header)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        }
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status() # Check for 404/403 errors
+        
         soup = BeautifulSoup(response.content, 'html.parser')
-        # Extract text from paragraphs to avoid navigation menus
-        paragraphs = soup.find_all('p')
-        text = " ".join([p.get_text() for p in paragraphs])
-        return text[:10000], None # Limit to first 10k chars to avoid token limits
+        
+        # 2. Remove "junk" elements (scripts, styles, navs, footers, ads)
+        for script in soup(["script", "style", "nav", "footer", "header", "aside", "noscript"]):
+            script.decompose()
+
+        # 3. Target the main content area if possible
+        # Most articles use <article>, <main>, or <div class="content">
+        content_area = soup.find('article') or soup.find('main') or soup.body
+        
+        # 4. Extract text carefully
+        # We look for paragraphs <p> and headers <h1-h6> specifically
+        chunks = []
+        if content_area:
+            for element in content_area.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'li']):
+                text = element.get_text(strip=True)
+                # Filter out short snippets (likely menu items or social buttons)
+                if len(text) > 30: 
+                    chunks.append(text)
+        
+        full_text = "\n".join(chunks)
+        
+        # 5. Final validation
+        if len(full_text) < 200:
+            return None, "Couldn't extract enough text. The site might be blocking scrapers or using strict JavaScript."
+            
+        return full_text[:15000], None # Limit to 15k chars
+        
     except Exception as e:
-        return None, str(e)
+        return None, f"Scraping Error: {str(e)}"
 
 # ====================== GENERATE BUTTON ======================
 if st.button("🚀 Generate Flashcards", type="primary", use_container_width=True):
