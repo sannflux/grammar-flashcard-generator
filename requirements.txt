@@ -5,3 +5,4 @@ pydantic
 beautifulsoup4
 youtube-transcript-api
 requests
+Pillow
