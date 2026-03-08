@@ -84,45 +84,6 @@ def get_youtube_transcript(url):
 
 # ====================== UPDATED HELPER FUNCTIONS ======================
 
-def get_website_text(url):
-    try:
-        # 1. Pretend to be a real browser (User-Agent header)
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-        }
-        response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status() # Check for 404/403 errors
-        
-        soup = BeautifulSoup(response.content, 'html.parser')
-        
-        # 2. Remove "junk" elements (scripts, styles, navs, footers, ads)
-        for script in soup(["script", "style", "nav", "footer", "header", "aside", "noscript"]):
-            script.decompose()
-
-        # 3. Target the main content area if possible
-        # Most articles use <article>, <main>, or <div class="content">
-        content_area = soup.find('article') or soup.find('main') or soup.body
-        
-        # 4. Extract text carefully
-        # We look for paragraphs <p> and headers <h1-h6> specifically
-        chunks = []
-        if content_area:
-            for element in content_area.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'li']):
-                text = element.get_text(strip=True)
-                # Filter out short snippets (likely menu items or social buttons)
-                if len(text) > 30: 
-                    chunks.append(text)
-        
-        full_text = "\n".join(chunks)
-        
-        # 5. Final validation
-        if len(full_text) < 200:
-            return None, "Couldn't extract enough text. The site might be blocking scrapers or using strict JavaScript."
-            
-        return full_text[:15000], None # Limit to 15k chars
-        
-    except Exception as e:
-        return None, f"Scraping Error: {str(e)}"
 
 # ====================== GENERATE BUTTON ======================
 if st.button("🚀 Generate Flashcards", type="primary", use_container_width=True):
@@ -170,7 +131,52 @@ if st.button("🚀 Generate Flashcards", type="primary", use_container_width=Tru
 
             if source_type == "file":
                 status.update(label=f"Uploading {uploaded_file.name}...")
-                with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded_file.name)[1]) as tmp:
+                with tempfidef get_website_text(url):
+    try:
+        # 1. Pretend to be a real browser to avoid getting blocked
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        }
+        
+        # 2. Add a Timeout! (Stops it from hanging forever)
+        response = requests.get(url, headers=headers, timeout=5) 
+        response.raise_for_status()
+        
+        # 3. Use 'lxml' if installed (faster), else 'html.parser'
+        try:
+            soup = BeautifulSoup(response.content, 'lxml')
+        except:
+            soup = BeautifulSoup(response.content, 'html.parser')
+        
+        # 4. Remove junk elements
+        for script in soup(["script", "style", "nav", "footer", "header", "aside", "noscript", "form", "button"]):
+            script.decompose()
+
+        # 5. improved Text Extraction strategy
+        # Try to find the specific content block first
+        content = soup.find('article') or soup.find('main') or soup.find('div', class_='content') or soup.body
+        
+        if not content:
+            return None, "Could not find main content on this page."
+
+        # Get text and clean it up
+        text_content = content.get_text(separator=' ', strip=True)
+        
+        # Collapse multiple spaces into one
+        import re
+        clean_text = re.sub(r'\s+', ' ', text_content)
+
+        # 6. Final validation
+        if len(clean_text) < 300:
+            return None, "Not enough text found. Are you using a Homepage URL? Please try a specific article link."
+            
+        return clean_text[:15000], None 
+        
+    except requests.exceptions.Timeout:
+        return None, "The website took too long to respond. Try a different link."
+    except Exception as e:
+        return None, f"Scraping Error: {str(e)}"
+le.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded_file.name)[1]) as tmp:
                     tmp.write(uploaded_file.getbuffer())
                     tmp_path = tmp.name
                 gemini_file_ref = client.files.upload(file=tmp_path)
