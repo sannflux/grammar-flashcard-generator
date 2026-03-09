@@ -9,7 +9,6 @@ import json
 import time
 import io
 import base64
-import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 import altair as alt
 
@@ -24,7 +23,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 # ====================== 1. SAFE IMPORTS & CONFIGURATION ======================
 st.set_page_config(
-    page_title="Flashcard Library Pro v6.5", 
+    page_title="Flashcard Library Pro v5.5", 
     page_icon="🧠", 
     layout="wide",
     initial_sidebar_state="expanded"
@@ -79,16 +78,12 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT, deck_id INTEGER, front TEXT, back TEXT, 
             explanation TEXT, tag TEXT, ease_factor REAL DEFAULT 2.5, interval INTEGER DEFAULT 0,
             repetitions INTEGER DEFAULT 0, next_review TEXT DEFAULT CURRENT_DATE, last_reviewed TEXT,
-            card_type TEXT DEFAULT 'Basic',
             FOREIGN KEY(deck_id) REFERENCES decks(id) ON DELETE CASCADE)''')
         
-        # Safe Migrations
         try: c.execute("SELECT explanation FROM cards LIMIT 1")
         except sqlite3.OperationalError: c.execute("ALTER TABLE cards ADD COLUMN explanation TEXT DEFAULT ''")
         try: c.execute("SELECT last_reviewed FROM cards LIMIT 1")
         except sqlite3.OperationalError: c.execute("ALTER TABLE cards ADD COLUMN last_reviewed TEXT")
-        try: c.execute("SELECT card_type FROM cards LIMIT 1")
-        except sqlite3.OperationalError: c.execute("ALTER TABLE cards ADD COLUMN card_type TEXT DEFAULT 'Basic'")
         conn.commit()
 
 init_db()
@@ -135,8 +130,8 @@ def get_due_cards_count():
 
 # ====================== 4. AI CONTENT ENGINE & EXTRACTORS ======================
 class Flashcard(BaseModel):
-    front: str = Field(description="The front of the card (question or cloze sentence).")
-    back: str = Field(description="The back of the card (answer or extra cloze info).")
+    front: str = Field(description="The question/concept. Plain text.")
+    back: str = Field(description="The answer. Use HTML <b> for key terms.")
     explanation: str = Field(description="A short context or mnemonic explaining WHY the answer is correct.")
     tag: str = Field(description="A short category tag.")
 
@@ -155,84 +150,63 @@ def extract_pdf_text(uploaded_file):
     try:
         pdf_bytes = io.BytesIO(uploaded_file.getvalue())
         reader = PdfReader(pdf_bytes)
-        text = ""
-        for page in reader.pages:
-            page_text = page.extract_text()
-            if page_text:
-                text += page_text + "\n"
-                
-        if not text.strip():
-            # FIX: Return a tuple so it doesn't crash Python's unpacking
-            return "Error: This PDF appears to be an image/scan with no readable text layer.", 0
-            
-        return text[:25000], len(reader.pages)
-    except Exception as e: 
-        return f"Error reading PDF: {e}", 0
+        text = "".join(page.extract_text() + "\n" for page in reader.pages)
+        return text[:25000] 
+    except Exception as e: return f"Error reading PDF: {e}"
 
 def clean_web_markdown(text):
+    """Aggressively removes injected HTML error blocks, markdown links, and tracking codes."""
     text = re.sub(r'<HTML.*?>.*?</HTML>', '', text, flags=re.IGNORECASE | re.DOTALL)
     text = re.sub(r'!\[.*?\]\(.*?\)', '', text)
     text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)
+    
     lines = text.split('\n')
-    clean_lines = [line for line in lines if not ("Access Denied" in line or "edgesuite.net" in line or "Reference #" in line)]
+    clean_lines = []
+    for line in lines:
+        if "Access Denied" in line or "edgesuite.net" in line or "Reference #" in line:
+            continue
+        clean_lines.append(line)
+        
     text = '\n'.join(clean_lines)
     text = re.sub(r'\n\s*\n', '\n\n', text)
     return text.strip()
 
 def fetch_web_content(url):
+    """Fetches web content using Jina Reader to bypass WAFs, with fallback."""
     try:
         jina_url = f"https://r.jina.ai/{url}"
         resp = requests.get(jina_url, timeout=15)
         resp.raise_for_status()
+        
         text = clean_web_markdown(resp.text)
+        
         if not text or (text.count("Access Denied") > 5 and len(text) < 1000):
             raise ValueError("WAF")
+            
         return text[:25000]
     except Exception:
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "Accept": "text/html"}
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        }
         resp = requests.get(url, headers=headers, timeout=10)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.content, 'html.parser')
         for s in soup(["script", "style", "nav", "footer", "header"]): s.decompose()
-        return " ".join(soup.stripped_strings)[:25000]
-
-def fallback_youtube_extractor(video_id):
-    """Uses Jina AI to bypass Streamlit Cloud IP bans for YouTube transcripts."""
-    try:
-        jina_url = f"https://r.jina.ai/https://www.youtube.com/watch?v={video_id}"
-        resp = requests.get(jina_url, timeout=15)
-        resp.raise_for_status()
-        return clean_web_markdown(resp.text)
-    except Exception:
-        return None
+        text = " ".join(soup.stripped_strings)
+        return text[:25000]
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-def generate_flashcards(api_key, text_content, image_content, difficulty, count_val, card_type):
+def generate_flashcards(api_key, text_content, image_content, difficulty, count_val):
     client = genai.Client(api_key=api_key)
-    
-    if card_type == "Cloze":
-        mode_instruction = """
-        CREATE CLOZE DELETION CARDS. 
-        - The 'front' field MUST be a complete sentence with the key concept wrapped in Anki cloze syntax: `{{c1::target word}}`.
-        - The 'back' field should provide extra context, definition, or translation of the target word.
-        Example front: "The capital of France is {{c1::Paris}}."
-        """
-    else:
-        mode_instruction = """
-        CREATE BASIC Q&A CARDS.
-        - The 'front' field is a clear question.
-        - The 'back' field is the exact answer (use <b>bold</b> for keywords).
-        """
-
     system_prompt = f"""
     Act as a professor for {difficulty} level students. 
     Create {count_val} flashcards strictly based on the core educational content provided.
     
-    {mode_instruction}
-    
     CRITICAL INSTRUCTIONS:
-    - IGNORE website navigation menus, sidebars, and comments.
-    - Output JSON matching the schema perfectly.
+    - IGNORE website navigation menus, sidebars, 'Log in' prompts, and comment sections.
+    - Focus ONLY on the actual definitions, rules, or educational topics.
+    - Output JSON only. 'back' field MUST use <b>bold</b> tags for keywords.
     """
     
     contents = []
@@ -254,7 +228,6 @@ def generate_flashcards(api_key, text_content, image_content, difficulty, count_
 def text_to_speech_html(text):
     try:
         clean_text = re.sub(r'<[^>]+>', '', text)
-        clean_text = re.sub(r'\{\{c1::(.*?)\}\}', r'\1', clean_text) 
         tts = gTTS(text=clean_text, lang='en')
         fp = io.BytesIO()
         tts.write_to_fp(fp)
@@ -272,8 +245,6 @@ def inject_custom_css():
         .card-back { font-size: 18px; margin-bottom: 15px; color: var(--primary-color); line-height: 1.5; }
         .card-explanation { font-size: 14px; color: var(--text-color); opacity: 0.8; font-style: italic; border-top: 1px solid var(--text-color); padding-top: 10px; width: 100%; }
         .card-tag { background: var(--primary-color); color: #ffffff; padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: 600; text-transform: uppercase; margin-bottom: 15px; }
-        .cloze-blank { border-bottom: 2px solid var(--primary-color); color: transparent; padding: 0 10px; margin: 0 5px; }
-        .cloze-reveal { color: var(--primary-color); font-weight: bold; text-decoration: underline; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -295,13 +266,12 @@ def section_generator(api_key):
                 pdf_file = st.file_uploader("Upload PDF Document", type=["pdf"])
                 if pdf_file:
                     with st.spinner("Extracting text from PDF..."):
-                        raw_text, page_count = extract_pdf_text(pdf_file)
+                        raw_text = extract_pdf_text(pdf_file)
                         if "Error" not in raw_text:
-                            st.success(f"Successfully read {page_count} pages! ({len(raw_text)} characters extracted)")
+                            st.success(f"PDF Extracted! ({len(raw_text)} chars)")
                             with st.expander("Preview & Edit Extracted Text", expanded=True):
-                                content_text = st.text_area("Verify the text below before generating:", raw_text, height=200)
-                        else: 
-                            st.error(raw_text)
+                                content_text = st.text_area("Edit text before generating:", raw_text, height=200)
+                        else: st.error(raw_text)
             else: st.warning("Please install 'pypdf'")
             
         elif source_type == "Image Analysis":
@@ -312,39 +282,18 @@ def section_generator(api_key):
                 content_text = "Generate flashcards based on this image."
 
         elif source_type == "YouTube URL":
-            url = st.text_input("Video URL")
-            if url:
-                with st.spinner("Transcribing via Jina AI & Subtitles..."):
-                    try:
-                        match = re.search(r'(?:v=|youtu\.be\/|shorts\/|embed\/)([0-9A-Za-z_-]{11})', url)
-                        if not match:
-                            raise ValueError("Could not extract a valid 11-character YouTube Video ID from the URL.")
-                        video_id = match.group(1)
-                        
-                        raw_text = None
-                        if YOUTUBE_AVAILABLE:
-                            try:
-                                # Try to get English explicitly first, else fallback to default
-                                try:
-                                    raw_transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=['en', 'en-US', 'en-GB'])
-                                except:
-                                    raw_transcript = YouTubeTranscriptApi.get_transcript(video_id)
-                                raw_text = " ".join([t['text'] for t in raw_transcript])
-                            except Exception:
-                                pass # Blocked by Streamlit Cloud IP - falling through to Jina AI
-                                
-                        if not raw_text:
-                            raw_text = fallback_youtube_extractor(video_id)
-                            
-                        if raw_text:
+            if YOUTUBE_AVAILABLE:
+                url = st.text_input("Video URL")
+                if url:
+                    with st.spinner("Transcribing..."):
+                        try:
+                            video_id = url.split("v=")[1].split("&")[0]
+                            raw_text = " ".join([t['text'] for t in YouTubeTranscriptApi.get_transcript(video_id)])
                             st.success("Transcript Extracted!")
                             with st.expander("Preview & Edit Transcript", expanded=True):
                                 content_text = st.text_area("Edit text before generating:", raw_text, height=200)
-                        else:
-                            st.error("Failed to extract transcript. The video might not have captions enabled, or it is age-restricted.")
-                            
-                    except Exception as e: 
-                        st.error(f"Error: {e}")
+                        except Exception as e: st.error(f"Error: {e}")
+            else: st.warning("Install youtube-transcript-api")
 
         elif source_type == "Web Article":
             url = st.text_input("Article URL")
@@ -354,13 +303,12 @@ def section_generator(api_key):
                         raw_text = fetch_web_content(url)
                         st.success("Web Content Extracted!")
                         with st.expander("Preview & Edit Web Content", expanded=True):
-                            content_text = st.text_area("Edit text before generating:", raw_text, height=200)
+                            content_text = st.text_area("Edit text before generating (Note: AI will automatically ignore menus and comments):", raw_text, height=200)
                     except Exception as e: st.error(str(e))
 
     with col_sets:
         st.subheader("Config")
         deck_name = st.text_input("Deck Name", placeholder="e.g., Biology 101")
-        card_type = st.radio("Card Format", ["Basic", "Cloze"], help="Basic = Q&A. Cloze = Fill-in-the-blank. (Do not mix types if exporting to Anki later).")
         difficulty = st.select_slider("Level", ["Beginner", "Intermediate", "Expert"], value="Intermediate")
         qty = st.number_input("Count", 1, 30, 10)
         
@@ -368,18 +316,18 @@ def section_generator(api_key):
             if not api_key: st.error("API Key Missing"); return
             if not (content_text or image_content): st.warning("No valid content"); return
             
-            with st.spinner(f"Gemini is building {card_type} cards..."):
+            with st.spinner("Gemini is thinking..."):
                 try:
-                    cards = generate_flashcards(api_key, content_text, image_content, difficulty, qty, card_type)
+                    cards = generate_flashcards(api_key, content_text, image_content, difficulty, qty)
                     if cards and deck_name:
                         with get_db_connection() as conn:
                             c = conn.cursor()
                             c.execute("INSERT OR IGNORE INTO decks (name, created_at) VALUES (?, ?)", (deck_name, datetime.now().strftime("%Y-%m-%d")))
                             deck_id = c.execute("SELECT id FROM decks WHERE name=?", (deck_name,)).fetchone()[0]
-                            data = [(deck_id, clean_text(c['front']), clean_text(c['back']), c.get('explanation', ''), c['tag'], card_type) for c in cards]
-                            c.executemany("INSERT INTO cards (deck_id, front, back, explanation, tag, card_type) VALUES (?, ?, ?, ?, ?, ?)", data)
+                            data = [(deck_id, clean_text(c['front']), clean_text(c['back']), c.get('explanation', ''), c['tag']) for c in cards]
+                            c.executemany("INSERT INTO cards (deck_id, front, back, explanation, tag) VALUES (?, ?, ?, ?, ?)", data)
                             conn.commit()
-                        st.success(f"Created {len(cards)} {card_type} cards!")
+                        st.success(f"Created {len(cards)} cards!")
                 except Exception as e: st.error(f"Failed: {e}")
 
     with st.expander("✍️ Create Flashcard Manually"):
@@ -387,23 +335,21 @@ def section_generator(api_key):
             with get_db_connection() as conn:
                 existing_decks = [d['name'] for d in conn.execute("SELECT name FROM decks").fetchall()]
             m_deck = st.selectbox("Select Deck", existing_decks) if existing_decks else st.text_input("New Deck Name")
-            m_type = st.selectbox("Type", ["Basic", "Cloze"])
-            st.caption("If Cloze, wrap hidden text like this: `{{c1::hidden text}}`")
-            m_front = st.text_area("Front")
-            m_back = st.text_area("Back (or extra info for Cloze)")
+            m_front = st.text_area("Front (Question)")
+            m_back = st.text_area("Back (Answer)")
             m_exp = st.text_input("Explanation (Optional)")
             m_tag = st.text_input("Tag", "Manual")
             
             if st.form_submit_button("Save Card"):
-                if m_deck and m_front:
+                if m_deck and m_front and m_back:
                     with get_db_connection() as conn:
                         c = conn.cursor()
                         c.execute("INSERT OR IGNORE INTO decks (name, created_at) VALUES (?, ?)", (m_deck, datetime.now().strftime("%Y-%m-%d")))
                         d_id = c.execute("SELECT id FROM decks WHERE name=?", (m_deck,)).fetchone()[0]
-                        c.execute("INSERT INTO cards (deck_id, front, back, explanation, tag, card_type) VALUES (?, ?, ?, ?, ?, ?)", (d_id, m_front, m_back, m_exp, m_tag, m_type))
+                        c.execute("INSERT INTO cards (deck_id, front, back, explanation, tag) VALUES (?, ?, ?, ?, ?)", (d_id, m_front, m_back, m_exp, m_tag))
                         conn.commit()
                     st.success("Card added!")
-                else: st.error("Deck and Front are required.")
+                else: st.error("Missing fields")
 
 def cb_show_answer(): st.session_state["show_answer"] = True
 def cb_submit_review(score, card_id):
@@ -452,38 +398,22 @@ def section_study():
         card = queue[idx]
         st.progress((idx + 1) / len(queue), text=f"Card {idx+1}/{len(queue)}")
         
-        front_content = card['front']
-        back_content = "<span style='opacity:0.6;'>(Think...)</span>"
-        explanation_html = ""
-        audio_html = ""
-        
-        # Cloze & Basic Rendering Logic
-        if card.get('card_type') == 'Cloze':
-            if not st.session_state["show_answer"]:
-                front_content = re.sub(r'\{\{c1::(.*?)\}\}', r'<span class="cloze-blank">[ ... ]</span>', front_content)
-            else:
-                front_content = re.sub(r'\{\{c1::(.*?)\}\}', r'<span class="cloze-reveal">\1</span>', front_content)
-                back_content = f"<i>Extra Info: {card['back']}</i>" if card['back'] else ""
-                audio_html = text_to_speech_html(card['front']) 
-        else:
-            if st.session_state["show_answer"]:
-                back_content = card['back']
-                audio_html = text_to_speech_html(card['front'] + " ... " + card['back'])
-
-        if st.session_state["show_answer"] and card.get("explanation"): 
-            explanation_html = f'<div class="card-explanation">💡 {card["explanation"]}</div>'
+        audio_html, back_content, explanation_html = "", "<span style='opacity:0.6;'>(Think...)</span>", ""
+        if st.session_state["show_answer"]:
+            back_content = card['back']
+            audio_html = text_to_speech_html(card['front'] + " ... " + card['back'])
+            if card.get("explanation"): explanation_html = f'<div class="card-explanation">💡 {card["explanation"]}</div>'
 
         st.markdown(f"""
         <div class="flashcard">
-            <div class="card-tag">{card['tag']} | {card.get('card_type', 'Basic')}</div>
-            <div class="card-front">{front_content}</div>
+            <div class="card-tag">{card['tag']}</div>
+            <div class="card-front">{card['front']}</div>
             <div class="card-back">{back_content}</div>
             {explanation_html}{audio_html}
         </div>""", unsafe_allow_html=True)
         st.write("") 
         
-        if not st.session_state["show_answer"]: 
-            st.button("👁️ Show Answer", type="primary", use_container_width=True, on_click=cb_show_answer)
+        if not st.session_state["show_answer"]: st.button("👁️ Show Answer", type="primary", use_container_width=True, on_click=cb_show_answer)
         else:
             cols, labels, scores = st.columns(4), ["Again", "Hard", "Good", "Easy"], [0, 3, 4, 5]
             for i, col in enumerate(cols): col.button(labels[i], use_container_width=True, on_click=cb_submit_review, args=(scores[i], card['id']))
@@ -512,9 +442,17 @@ def section_library():
 
     with t1:
         if not df_cards.empty:
+            # FIX: Use explicit suffixes to prevent KeyError
             df_merged = pd.merge(df_cards, decks, left_on="deck_id", right_on="id", suffixes=('_card', '_deck'))
-            stats_df = df_merged.groupby("name").agg({"repetitions": "mean", "ease_factor": "mean", "id_card": "count"}).rename(columns={"id_card": "Total Cards", "repetitions": "Avg Reps", "ease_factor": "Avg Ease"})
+            
+            stats_df = df_merged.groupby("name").agg({
+                "repetitions": "mean", 
+                "ease_factor": "mean", 
+                "id_card": "count"
+            }).rename(columns={"id_card": "Total Cards", "repetitions": "Avg Reps", "ease_factor": "Avg Ease"})
+            
             st.dataframe(stats_df, use_container_width=True)
+            
             if df_cards['last_reviewed'].notna().any():
                 df_cards['last_reviewed'] = pd.to_datetime(df_cards['last_reviewed']).dt.date
                 activity = df_cards['last_reviewed'].value_counts().reset_index()
@@ -523,26 +461,18 @@ def section_library():
 
     with t2:
         if not df_cards.empty:
-            edited = st.data_editor(df_cards[['id', 'card_type', 'front', 'back', 'explanation', 'tag']], hide_index=True, use_container_width=True, disabled=["id"])
+            edited = st.data_editor(df_cards[['id', 'front', 'back', 'explanation', 'tag']], hide_index=True, use_container_width=True, disabled=["id"])
             if st.button("💾 Save to DB", type="primary"):
                 with get_db_connection() as conn:
-                    for _, r in edited.iterrows(): conn.execute("UPDATE cards SET card_type=?, front=?, back=?, explanation=?, tag=? WHERE id=?", (r['card_type'], r['front'], r['back'], r['explanation'], r['tag'], r['id']))
+                    for _, r in edited.iterrows(): conn.execute("UPDATE cards SET front=?, back=?, explanation=?, tag=? WHERE id=?", (r['front'], r['back'], r['explanation'], r['tag'], r['id']))
                     conn.commit()
                 st.success("Updated!")
 
     with t3:
-        st.info("💡 Anki requires importing 'Basic' and 'Cloze' cards separately. Use the filter below.")
-        c_deck, c_type = st.columns(2)
-        with c_deck: export_deck = st.selectbox("Select Deck", decks['name'].tolist())
-        with c_type: export_type = st.selectbox("Card Type to Export", ["Basic", "Cloze"])
-        
+        export_deck = st.selectbox("Export Deck", decks['name'].tolist())
         deck_id_raw = decks[decks['name'] == export_deck].iloc[0]['id']
-        with get_db_connection() as conn: 
-            cards_df = pd.read_sql("SELECT front, back, tag FROM cards WHERE deck_id=? AND card_type=?", conn, params=(int(deck_id_raw), export_type))
-        
-        file_name = f"{export_deck}_{export_type}.csv"
-        st.download_button(f"Download {export_type} CSV", data=cards_df.to_csv(index=False, header=False).encode('utf-8') if not cards_df.empty else b"", file_name=file_name, disabled=cards_df.empty)
-        if cards_df.empty: st.warning(f"No {export_type} cards found in this deck.")
+        with get_db_connection() as conn: cards_df = pd.read_sql("SELECT front, back, tag FROM cards WHERE deck_id=?", conn, params=(int(deck_id_raw),))
+        st.download_button("Download CSV", data=cards_df.to_csv(index=False, header=False).encode('utf-8') if not cards_df.empty else b"", file_name=f"{export_deck}.csv", disabled=cards_df.empty)
 
     with t4:
         c1, c2 = st.columns(2)
