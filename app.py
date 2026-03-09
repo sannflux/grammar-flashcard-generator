@@ -23,7 +23,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 # ====================== 1. SAFE IMPORTS & CONFIGURATION ======================
 st.set_page_config(
-    page_title="Flashcard Library Pro v5.6", 
+    page_title="Flashcard Library Pro v5.5", 
     page_icon="🧠", 
     layout="wide",
     initial_sidebar_state="expanded"
@@ -236,20 +236,6 @@ def text_to_speech_html(text):
         return f'<audio controls style="height: 30px; width: 100%; margin-top: 10px;"><source src="data:audio/mp3;base64,{b64}" type="audio/mp3"></audio>'
     except Exception: return ""
 
-def extract_youtube_id(url):
-    """Robustly extracts YouTube Video IDs from various URL formats."""
-    parsed_url = urllib.parse.urlparse(url)
-    if parsed_url.hostname == 'youtu.be':
-        return parsed_url.path[1:]
-    if parsed_url.hostname in ('www.youtube.com', 'youtube.com'):
-        if parsed_url.path == '/watch':
-            return urllib.parse.parse_qs(parsed_url.query).get('v', [None])[0]
-        if parsed_url.path.startswith(('/shorts/', '/embed/', '/v/')):
-            return parsed_url.path.split('/')[2]
-    # Fallback Regex
-    match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11}).*', url)
-    return match.group(1) if match else None
-
 # ====================== 5. UI COMPONENTS & CSS ======================
 def inject_custom_css():
     st.markdown("""
@@ -301,16 +287,12 @@ def section_generator(api_key):
                 if url:
                     with st.spinner("Transcribing..."):
                         try:
-                            video_id = extract_youtube_id(url)
-                            if not video_id:
-                                raise ValueError("Could not extract a valid YouTube ID from the provided URL.")
-                                
+                            video_id = url.split("v=")[1].split("&")[0]
                             raw_text = " ".join([t['text'] for t in YouTubeTranscriptApi.get_transcript(video_id)])
                             st.success("Transcript Extracted!")
                             with st.expander("Preview & Edit Transcript", expanded=True):
                                 content_text = st.text_area("Edit text before generating:", raw_text, height=200)
-                        except Exception as e: 
-                            st.error(f"Error fetching transcript: {e}")
+                        except Exception as e: st.error(f"Error: {e}")
             else: st.warning("Install youtube-transcript-api")
 
         elif source_type == "Web Article":
@@ -460,6 +442,7 @@ def section_library():
 
     with t1:
         if not df_cards.empty:
+            # FIX: Use explicit suffixes to prevent KeyError
             df_merged = pd.merge(df_cards, decks, left_on="deck_id", right_on="id", suffixes=('_card', '_deck'))
             
             stats_df = df_merged.groupby("name").agg({
