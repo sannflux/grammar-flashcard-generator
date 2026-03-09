@@ -3,6 +3,7 @@ import pandas as pd
 import sqlite3
 import re
 import requests
+import urllib.parse
 import math
 import json
 import time
@@ -17,19 +18,17 @@ from pydantic import BaseModel, Field
 from typing import List, Optional
 from PIL import Image
 
-# For TTS and Retries
 from gtts import gTTS
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 # ====================== 1. SAFE IMPORTS & CONFIGURATION ======================
 st.set_page_config(
-    page_title="Flashcard Library Pro v5.0", 
+    page_title="Flashcard Library Pro v5.1", 
     page_icon="🧠", 
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# Dependencies Check
 try:
     from bs4 import BeautifulSoup
     BS4_AVAILABLE = True
@@ -48,7 +47,6 @@ try:
 except ImportError:
     PDF_AVAILABLE = False
 
-# Initialize Session State
 DEFAULT_STATE = {
     "current_deck_id": None,
     "study_queue": [],      
@@ -62,7 +60,7 @@ for key, value in DEFAULT_STATE.items():
     if key not in st.session_state:
         st.session_state[key] = value
 
-# ====================== 2. DATABASE ENGINE (WAL Mode) ======================
+# ====================== 2. DATABASE ENGINE ======================
 DB_NAME = "flashcards_v5.db"
 
 def get_db_connection():
@@ -74,93 +72,56 @@ def init_db():
     with get_db_connection() as conn:
         c = conn.cursor()
         c.execute("PRAGMA journal_mode=WAL;")
-        
         c.execute('''CREATE TABLE IF NOT EXISTS decks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, 
-            name TEXT UNIQUE, 
-            description TEXT,
-            created_at TEXT
-        )''')
-        
+            id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE, description TEXT, created_at TEXT)''')
         c.execute('''CREATE TABLE IF NOT EXISTS cards (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, 
-            deck_id INTEGER, 
-            front TEXT, 
-            back TEXT, 
-            explanation TEXT,
-            tag TEXT,
-            ease_factor REAL DEFAULT 2.5,
-            interval INTEGER DEFAULT 0,
-            repetitions INTEGER DEFAULT 0,
-            next_review TEXT DEFAULT CURRENT_DATE,
-            last_reviewed TEXT,
-            FOREIGN KEY(deck_id) REFERENCES decks(id) ON DELETE CASCADE
-        )''')
+            id INTEGER PRIMARY KEY AUTOINCREMENT, deck_id INTEGER, front TEXT, back TEXT, 
+            explanation TEXT, tag TEXT, ease_factor REAL DEFAULT 2.5, interval INTEGER DEFAULT 0,
+            repetitions INTEGER DEFAULT 0, next_review TEXT DEFAULT CURRENT_DATE, last_reviewed TEXT,
+            FOREIGN KEY(deck_id) REFERENCES decks(id) ON DELETE CASCADE)''')
         
-        # Migrations
-        try:
-            c.execute("SELECT explanation FROM cards LIMIT 1")
-        except sqlite3.OperationalError:
-            c.execute("ALTER TABLE cards ADD COLUMN explanation TEXT DEFAULT ''")
-        
-        try:
-            c.execute("SELECT last_reviewed FROM cards LIMIT 1")
-        except sqlite3.OperationalError:
-            c.execute("ALTER TABLE cards ADD COLUMN last_reviewed TEXT")
-            
+        try: c.execute("SELECT explanation FROM cards LIMIT 1")
+        except sqlite3.OperationalError: c.execute("ALTER TABLE cards ADD COLUMN explanation TEXT DEFAULT ''")
+        try: c.execute("SELECT last_reviewed FROM cards LIMIT 1")
+        except sqlite3.OperationalError: c.execute("ALTER TABLE cards ADD COLUMN last_reviewed TEXT")
         conn.commit()
 
 init_db()
 
-# ====================== 3. CORE LOGIC: SPACED REPETITION & DB OPS ======================
+# ====================== 3. CORE LOGIC ======================
 def update_card_sm2(card_id, quality):
     with get_db_connection() as conn:
         c = conn.cursor()
         c.execute("SELECT ease_factor, interval, repetitions FROM cards WHERE id=?", (card_id,))
         row = c.fetchone()
-        
         if row:
             ease, interval, reps = row['ease_factor'], row['interval'], row['repetitions']
-            
             if quality < 3:
-                reps = 0
-                interval = 1
+                reps, interval = 0, 1
             else:
-                if reps == 0:
-                    interval = 1
-                elif reps == 1:
-                    interval = 6
-                else:
-                    interval = math.ceil(interval * ease)
-                
+                interval = 1 if reps == 0 else (6 if reps == 1 else math.ceil(interval * ease))
                 reps += 1
-                ease = ease + (0.1 - (5 - quality) * (0.08 + (5 - quality) * 0.02))
-                if ease < 1.3: ease = 1.3
+                ease = max(1.3, ease + (0.1 - (5 - quality) * (0.08 + (5 - quality) * 0.02)))
 
             next_review = (datetime.now() + timedelta(days=interval)).strftime("%Y-%m-%d")
             last_reviewed = datetime.now().strftime("%Y-%m-%d")
 
-            c.execute('''UPDATE cards 
-                         SET ease_factor=?, interval=?, repetitions=?, next_review=?, last_reviewed=? 
-                         WHERE id=?''', 
+            c.execute('''UPDATE cards SET ease_factor=?, interval=?, repetitions=?, next_review=?, last_reviewed=? WHERE id=?''', 
                       (ease, interval, reps, next_review, last_reviewed, card_id))
             conn.commit()
 
 def delete_deck(deck_name):
     with get_db_connection() as conn:
-        c = conn.cursor()
-        c.execute("DELETE FROM decks WHERE name=?", (deck_name,))
+        conn.execute("DELETE FROM decks WHERE name=?", (deck_name,))
         conn.commit()
 
 def rename_deck(old_name, new_name):
     try:
         with get_db_connection() as conn:
-            c = conn.cursor()
-            c.execute("UPDATE decks SET name=? WHERE name=?", (new_name, old_name))
+            conn.execute("UPDATE decks SET name=? WHERE name=?", (new_name, old_name))
             conn.commit()
         return True
-    except sqlite3.IntegrityError:
-        return False
+    except sqlite3.IntegrityError: return False
 
 def get_due_cards_count():
     today = datetime.now().strftime("%Y-%m-%d")
@@ -172,56 +133,53 @@ class Flashcard(BaseModel):
     front: str = Field(description="The question/concept. Plain text.")
     back: str = Field(description="The answer. Use HTML <b> for key terms.")
     explanation: str = Field(description="A short context or mnemonic explaining WHY the answer is correct.")
-    tag: str = Field(description="A short category tag (e.g., 'History', 'Formula').")
+    tag: str = Field(description="A short category tag.")
 
 class FlashcardSet(BaseModel):
     cards: List[Flashcard]
 
 def clean_text(text):
     if not text: return ""
-    text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text) 
-    return text.strip()
+    return re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text).strip()
 
 def sanitize_json(text):
     text = re.sub(r'^```json', '', text, flags=re.MULTILINE)
-    text = re.sub(r'^```', '', text, flags=re.MULTILINE)
-    return text.strip()
+    return re.sub(r'^```', '', text, flags=re.MULTILINE).strip()
 
 def extract_pdf_text(uploaded_file):
-    if not PDF_AVAILABLE:
-        return "Error: pypdf not installed."
     try:
-        # BUG FIX: Read via BytesIO for reliable Streamlit file handling
         pdf_bytes = io.BytesIO(uploaded_file.getvalue())
         reader = PdfReader(pdf_bytes)
-        text = ""
-        for page in reader.pages:
-            text += page.extract_text() + "\n"
+        text = "".join(page.extract_text() + "\n" for page in reader.pages)
         return text[:25000] 
-    except Exception as e:
-        return f"Error reading PDF: {e}"
+    except Exception as e: return f"Error reading PDF: {e}"
+
+def fetch_web_content(url):
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5"
+    }
+    try:
+        resp = requests.get(url, headers=headers, timeout=10)
+        resp.raise_for_status()
+        return resp.content
+    except requests.exceptions.RequestException:
+        # Fallback Proxy for strict sites like British Council
+        proxy_url = f"https://api.allorigins.win/raw?url={urllib.parse.quote(url)}"
+        resp = requests.get(proxy_url, timeout=15)
+        resp.raise_for_status()
+        return resp.content
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
 def generate_flashcards(api_key, text_content, image_content, difficulty, count_val):
     client = genai.Client(api_key=api_key)
-    
-    system_prompt = f"""
-    Act as a professor for {difficulty} level students.
-    Create {count_val} flashcards based strictly on the user input.
-    
-    RULES:
-    1. Output JSON only.
-    2. 'back' field MUST use <b>bold</b> tags for keywords.
-    3. 'explanation' field should provide context or a mnemonic.
-    """
+    system_prompt = f"Act as a professor for {difficulty} level students. Create {count_val} flashcards strictly based on the user input. RULES: Output JSON only. 'back' field MUST use <b>bold</b> tags for keywords."
     
     contents = []
-    if text_content:
-        contents.append(text_content)
-    if image_content:
-        contents.append(image_content)
+    if text_content: contents.append(text_content)
+    if image_content: contents.append(image_content)
         
-    # STRICT MODEL CONSTRAINT: gemini-2.5-flash-lite
     response = client.models.generate_content(
         model="gemini-2.5-flash-lite", 
         contents=contents,
@@ -232,40 +190,24 @@ def generate_flashcards(api_key, text_content, image_content, difficulty, count_
             temperature=0.3
         )
     )
-    clean_json = sanitize_json(response.text)
-    return json.loads(clean_json).get("cards", [])
+    return json.loads(sanitize_json(response.text)).get("cards", [])
 
 def text_to_speech_html(text):
-    """Generates an HTML audio player using gTTS."""
     try:
-        clean_audio_text = re.sub(r'<[^>]+>', '', text) # remove HTML tags
-        tts = gTTS(text=clean_audio_text, lang='en')
+        clean_text = re.sub(r'<[^>]+>', '', text)
+        tts = gTTS(text=clean_text, lang='en')
         fp = io.BytesIO()
         tts.write_to_fp(fp)
         fp.seek(0)
         b64 = base64.b64encode(fp.read()).decode()
         return f'<audio controls style="height: 30px; width: 100%; margin-top: 10px;"><source src="data:audio/mp3;base64,{b64}" type="audio/mp3"></audio>'
-    except Exception:
-        return ""
+    except Exception: return ""
 
 # ====================== 5. UI COMPONENTS & CSS ======================
 def inject_custom_css():
     st.markdown("""
     <style>
-        .flashcard {
-            background-color: var(--secondary-background-color);
-            border: 1px solid var(--text-color);
-            border-radius: 15px;
-            padding: 30px; 
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-            min-height: 300px;
-            display: flex;
-            flex-direction: column;
-            justify-content: center;
-            align-items: center;
-            text-align: center;
-            margin-bottom: 20px;
-        }
+        .flashcard { background-color: var(--secondary-background-color); border: 1px solid var(--text-color); border-radius: 15px; padding: 30px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); min-height: 300px; display: flex; flex-direction: column; justify-content: center; align-items: center; text-align: center; margin-bottom: 20px; }
         .card-front { font-size: 24px; font-weight: 700; margin-bottom: 20px; color: var(--text-color); }
         .card-back { font-size: 18px; margin-bottom: 15px; color: var(--primary-color); line-height: 1.5; }
         .card-explanation { font-size: 14px; color: var(--text-color); opacity: 0.8; font-style: italic; border-top: 1px solid var(--text-color); padding-top: 10px; width: 100%; }
@@ -274,17 +216,14 @@ def inject_custom_css():
     """, unsafe_allow_html=True)
 
 # ====================== 6. APPLICATION SECTIONS ======================
-
 def section_generator(api_key):
     st.header("🏭 Flashcard Factory")
     
     col_input, col_sets = st.columns([2, 1])
+    content_text, image_content = "", None
     
     with col_input:
         source_type = st.radio("Input Source", ["Text/Paste", "Upload PDF", "Image Analysis", "YouTube URL", "Web Article"], horizontal=True)
-        
-        content_text = ""
-        image_content = None
         
         if source_type == "Text/Paste":
             content_text = st.text_area("Paste Notes Here", height=200)
@@ -294,20 +233,20 @@ def section_generator(api_key):
                 pdf_file = st.file_uploader("Upload PDF Document", type=["pdf"])
                 if pdf_file:
                     with st.spinner("Extracting text from PDF..."):
-                        content_text = extract_pdf_text(pdf_file)
-                        if "Error" not in content_text:
-                            st.success(f"PDF Loaded ({len(content_text)} chars)")
-                        else:
-                            st.error(content_text)
-            else:
-                st.warning("Please install 'pypdf' to use this feature.")
+                        raw_text = extract_pdf_text(pdf_file)
+                        if "Error" not in raw_text:
+                            st.success(f"PDF Extracted! ({len(raw_text)} chars)")
+                            with st.expander("Preview & Edit Extracted Text", expanded=True):
+                                content_text = st.text_area("Edit text before generating:", raw_text, height=200)
+                        else: st.error(raw_text)
+            else: st.warning("Please install 'pypdf'")
             
         elif source_type == "Image Analysis":
-            img_file = st.file_uploader("Upload Diagram/Chart", type=["png", "jpg", "jpeg"])
+            img_file = st.file_uploader("Upload Diagram", type=["png", "jpg", "jpeg"])
             if img_file:
                 image_content = Image.open(img_file)
-                st.image(image_content, caption="Image for Analysis", width=300)
-                content_text = "Generate flashcards based on the visual information in this image."
+                st.image(image_content, width=300)
+                content_text = "Generate flashcards based on this image."
 
         elif source_type == "YouTube URL":
             if YOUTUBE_AVAILABLE:
@@ -316,35 +255,28 @@ def section_generator(api_key):
                     with st.spinner("Transcribing..."):
                         try:
                             video_id = url.split("v=")[1].split("&")[0]
-                            transcript = YouTubeTranscriptApi.get_transcript(video_id)
-                            content_text = " ".join([t['text'] for t in transcript])
-                            st.success(f"Transcript Loaded ({len(content_text)} chars)")
-                        except Exception as e:
-                            st.error(f"Error: {e}")
-            else:
-                st.warning("Install youtube-transcript-api to use this.")
+                            raw_text = " ".join([t['text'] for t in YouTubeTranscriptApi.get_transcript(video_id)])
+                            st.success("Transcript Extracted!")
+                            with st.expander("Preview & Edit Transcript", expanded=True):
+                                content_text = st.text_area("Edit text before generating:", raw_text, height=200)
+                        except Exception as e: st.error(f"Error: {e}")
+            else: st.warning("Install youtube-transcript-api")
 
         elif source_type == "Web Article":
             if BS4_AVAILABLE:
                 url = st.text_input("Article URL")
                 if url:
-                    try:
-                        # BUG FIX: Better headers to bypass basic bot-protection (e.g. British Council)
-                        headers = {
-                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
-                            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-                            "Accept-Language": "en-US,en;q=0.5"
-                        }
-                        resp = requests.get(url, headers=headers, timeout=15)
-                        resp.raise_for_status()
-                        soup = BeautifulSoup(resp.content, 'html.parser')
-                        for s in soup(["script", "style", "nav", "footer"]): s.decompose()
-                        content_text = " ".join(soup.stripped_strings)[:25000]
-                        st.success("Web Content Loaded")
-                    except requests.exceptions.RequestException as e:
-                        st.error(f"Failed to fetch URL. The site might be blocking bots. Error: {e}")
-            else:
-                st.warning("Install beautifulsoup4 to use this.")
+                    with st.spinner("Fetching Webpage..."):
+                        try:
+                            html_content = fetch_web_content(url)
+                            soup = BeautifulSoup(html_content, 'html.parser')
+                            for s in soup(["script", "style", "nav", "footer", "header"]): s.decompose()
+                            raw_text = " ".join(soup.stripped_strings)[:25000]
+                            st.success("Web Content Extracted!")
+                            with st.expander("Preview & Edit Web Content", expanded=True):
+                                content_text = st.text_area("Edit text before generating:", raw_text, height=200)
+                        except Exception as e: st.error(f"Error: {e}")
+            else: st.warning("Install beautifulsoup4")
 
     with col_sets:
         st.subheader("Config")
@@ -353,37 +285,27 @@ def section_generator(api_key):
         qty = st.number_input("Count", 1, 30, 10)
         
         if st.button("🚀 Generate via AI", type="primary", use_container_width=True):
-            if not api_key:
-                st.error("API Key Missing")
-                return
-            if not (content_text or image_content):
-                st.warning("No content provided")
-                return
+            if not api_key: st.error("API Key Missing"); return
+            if not (content_text or image_content): st.warning("No valid content"); return
             
-            with st.spinner("Gemini is thinking... (Auto-retrying if rate limited)"):
+            with st.spinner("Gemini is thinking..."):
                 try:
                     cards = generate_flashcards(api_key, content_text, image_content, difficulty, qty)
                     if cards and deck_name:
                         with get_db_connection() as conn:
                             c = conn.cursor()
-                            c.execute("INSERT OR IGNORE INTO decks (name, created_at) VALUES (?, ?)", 
-                                      (deck_name, datetime.now().strftime("%Y-%m-%d")))
-                            c.execute("SELECT id FROM decks WHERE name=?", (deck_name,))
-                            deck_id = c.fetchone()[0]
-                            
+                            c.execute("INSERT OR IGNORE INTO decks (name, created_at) VALUES (?, ?)", (deck_name, datetime.now().strftime("%Y-%m-%d")))
+                            deck_id = c.execute("SELECT id FROM decks WHERE name=?", (deck_name,)).fetchone()[0]
                             data = [(deck_id, clean_text(c['front']), clean_text(c['back']), c.get('explanation', ''), c['tag']) for c in cards]
                             c.executemany("INSERT INTO cards (deck_id, front, back, explanation, tag) VALUES (?, ?, ?, ?, ?)", data)
                             conn.commit()
                         st.success(f"Created {len(cards)} cards!")
-                except Exception as e:
-                    st.error(f"Failed to generate after retries: {e}")
+                except Exception as e: st.error(f"Failed: {e}")
 
-    # Manual Creation Expander
-    with st.expander("✍️ Or Create Flashcard Manually"):
-        with st.form("manual_card_form", clear_on_submit=True):
+    with st.expander("✍️ Create Flashcard Manually"):
+        with st.form("manual_card", clear_on_submit=True):
             with get_db_connection() as conn:
                 existing_decks = [d['name'] for d in conn.execute("SELECT name FROM decks").fetchall()]
-            
             m_deck = st.selectbox("Select Deck", existing_decks) if existing_decks else st.text_input("New Deck Name")
             m_front = st.text_area("Front (Question)")
             m_back = st.text_area("Back (Answer)")
@@ -394,25 +316,16 @@ def section_generator(api_key):
                 if m_deck and m_front and m_back:
                     with get_db_connection() as conn:
                         c = conn.cursor()
-                        c.execute("INSERT OR IGNORE INTO decks (name, created_at) VALUES (?, ?)", 
-                                  (m_deck, datetime.now().strftime("%Y-%m-%d")))
-                        c.execute("SELECT id FROM decks WHERE name=?", (m_deck,))
-                        d_id = c.fetchone()[0]
-                        c.execute("INSERT INTO cards (deck_id, front, back, explanation, tag) VALUES (?, ?, ?, ?, ?)", 
-                                  (d_id, m_front, m_back, m_exp, m_tag))
+                        c.execute("INSERT OR IGNORE INTO decks (name, created_at) VALUES (?, ?)", (m_deck, datetime.now().strftime("%Y-%m-%d")))
+                        d_id = c.execute("SELECT id FROM decks WHERE name=?", (m_deck,)).fetchone()[0]
+                        c.execute("INSERT INTO cards (deck_id, front, back, explanation, tag) VALUES (?, ?, ?, ?, ?)", (d_id, m_front, m_back, m_exp, m_tag))
                         conn.commit()
-                    st.success("Card added manually!")
-                else:
-                    st.error("Deck, Front, and Back are required.")
+                    st.success("Card added!")
+                else: st.error("Missing fields")
 
-# Callbacks for Study Session
-def cb_show_answer():
-    st.session_state["show_answer"] = True
-
+def cb_show_answer(): st.session_state["show_answer"] = True
 def cb_submit_review(score, card_id):
-    if not st.session_state["cram_mode"]:
-        update_card_sm2(card_id, score)
-    
+    if not st.session_state["cram_mode"]: update_card_sm2(card_id, score)
     st.session_state["session_stats"]["reviewed"] += 1
     if score >= 3: st.session_state["session_stats"]["correct"] += 1
     st.session_state["study_index"] += 1
@@ -420,13 +333,9 @@ def cb_submit_review(score, card_id):
 
 def section_study():
     st.header("🧘 Zen Study Mode")
-    
     with get_db_connection() as conn:
         decks = conn.execute("SELECT id, name FROM decks").fetchall()
-    
-    if not decks:
-        st.info("No decks found.")
-        return
+    if not decks: st.info("No decks."); return
 
     col_deck, col_mode = st.columns([3, 1])
     with col_deck:
@@ -436,245 +345,119 @@ def section_study():
     
     with col_mode:
         st.write("") 
-        cram = st.toggle("🔥 Cram Mode", value=st.session_state["cram_mode"], help="Ignore schedule, shuffle all cards.")
+        cram = st.toggle("🔥 Cram Mode", value=st.session_state["cram_mode"])
         if cram != st.session_state["cram_mode"]:
             st.session_state["cram_mode"] = cram
             st.session_state["current_deck_id"] = None 
             st.rerun()
 
-    # Load Queue
     if st.session_state["current_deck_id"] != deck_id:
         st.session_state["current_deck_id"] = deck_id
-        
         with get_db_connection() as conn:
             if st.session_state["cram_mode"]:
-                q = "SELECT * FROM cards WHERE deck_id = ? ORDER BY RANDOM() LIMIT 50"
-                cards = conn.execute(q, (deck_id,)).fetchall()
+                cards = conn.execute("SELECT * FROM cards WHERE deck_id = ? ORDER BY RANDOM() LIMIT 50", (deck_id,)).fetchall()
             else:
-                today = datetime.now().strftime("%Y-%m-%d")
-                q = "SELECT * FROM cards WHERE deck_id = ? AND next_review <= ? ORDER BY next_review ASC LIMIT 50"
-                cards = conn.execute(q, (deck_id, today)).fetchall()
+                cards = conn.execute("SELECT * FROM cards WHERE deck_id = ? AND next_review <= ? ORDER BY next_review ASC LIMIT 50", (deck_id, datetime.now().strftime("%Y-%m-%d"))).fetchall()
             
             st.session_state["study_queue"] = [dict(c) for c in cards]
-            st.session_state["study_index"] = 0
-            st.session_state["show_answer"] = False
+            st.session_state["study_index"], st.session_state["show_answer"] = 0, False
             st.session_state["session_stats"] = {"reviewed": 0, "correct": 0, "start_time": time.time()}
 
-    queue = st.session_state["study_queue"]
-    idx = st.session_state["study_index"]
-
-    if not queue:
-        st.success("🎉 All caught up!" if not st.session_state["cram_mode"] else "Cram session complete! No cards found.")
-        return
+    queue, idx = st.session_state["study_queue"], st.session_state["study_index"]
+    if not queue: st.success("All caught up!"); return
 
     if idx < len(queue):
         card = queue[idx]
         st.progress((idx + 1) / len(queue), text=f"Card {idx+1}/{len(queue)}")
         
-        # Audio TTS Tag (only generated when showing answer)
-        audio_html = ""
-        back_content = "<span style='opacity:0.6; font-style:italic'>(Think...)</span>"
-        explanation_html = ""
-        
+        audio_html, back_content, explanation_html = "", "<span style='opacity:0.6;'>(Think...)</span>", ""
         if st.session_state["show_answer"]:
             back_content = card['back']
             audio_html = text_to_speech_html(card['front'] + " ... " + card['back'])
-            if card.get("explanation"):
-                explanation_html = f'<div class="card-explanation">💡 {card["explanation"]}</div>'
+            if card.get("explanation"): explanation_html = f'<div class="card-explanation">💡 {card["explanation"]}</div>'
 
-        # Render Flashcard
         st.markdown(f"""
         <div class="flashcard">
             <div class="card-tag">{card['tag']}</div>
             <div class="card-front">{card['front']}</div>
             <div class="card-back">{back_content}</div>
-            {explanation_html}
-            {audio_html}
-        </div>
-        """, unsafe_allow_html=True)
-
+            {explanation_html}{audio_html}
+        </div>""", unsafe_allow_html=True)
         st.write("") 
         
-        if not st.session_state["show_answer"]:
-            st.button("👁️ Show Answer", type="primary", use_container_width=True, on_click=cb_show_answer)
+        if not st.session_state["show_answer"]: st.button("👁️ Show Answer", type="primary", use_container_width=True, on_click=cb_show_answer)
         else:
-            cols = st.columns(4)
-            labels = ["Again (Fail)", "Hard", "Good", "Easy"]
-            scores = [0, 3, 4, 5]
-            
-            for i, col in enumerate(cols):
-                col.button(labels[i], use_container_width=True, on_click=cb_submit_review, args=(scores[i], card['id']))
-
+            cols, labels, scores = st.columns(4), ["Again", "Hard", "Good", "Easy"], [0, 3, 4, 5]
+            for i, col in enumerate(cols): col.button(labels[i], use_container_width=True, on_click=cb_submit_review, args=(scores[i], card['id']))
     else:
-        # Study Session Summary Screen
         st.balloons()
-        st.subheader("🏁 Session Complete!")
+        st.subheader("🏁 Complete!")
         stats = st.session_state["session_stats"]
         acc = int((stats["correct"]/stats["reviewed"]*100)) if stats["reviewed"] else 0
-        duration = round((time.time() - stats["start_time"]) / 60, 1) if stats["start_time"] else 0
-        
         c1, c2, c3 = st.columns(3)
-        c1.metric("Cards Reviewed", stats['reviewed'])
+        c1.metric("Cards", stats['reviewed'])
         c2.metric("Accuracy", f"{acc}%")
-        c3.metric("Time Spent", f"{duration} min")
-        
-        if st.button("🔄 Return to Library / Start Over"):
+        c3.metric("Time", f"{round((time.time() - stats['start_time']) / 60, 1) if stats['start_time'] else 0} min")
+        if st.button("Start Over"):
             st.session_state["current_deck_id"] = None
             st.rerun()
 
 def section_library():
-    st.header("📚 Library & Management")
-    
+    st.header("📚 Library")
     with get_db_connection() as conn:
-        df_cards = pd.read_sql("SELECT * FROM cards", conn)
-        decks = pd.read_sql("SELECT id, name, created_at FROM decks", conn)
-    
-    if decks.empty:
-        st.info("No decks found.")
-        return
+        df_cards, decks = pd.read_sql("SELECT * FROM cards", conn), pd.read_sql("SELECT * FROM decks", conn)
+    if decks.empty: st.info("No decks."); return
 
-    tab1, tab2, tab3, tab4 = st.tabs(["📊 Stats", "✏️ Edit Cards", "📤 Export", "🗑️ Manage Decks"])
+    t1, t2, t3, t4 = st.tabs(["📊 Stats", "✏️ Edit Cards", "📤 Export", "🗑️ Manage"])
 
-    with tab1:
+    with t1:
         if not df_cards.empty:
-            st.subheader("Deck Health")
-            df_merged = pd.merge(df_cards, decks, left_on="deck_id", right_on="id", suffixes=('_card', '_deck'))
-            
-            deck_stats = df_merged.groupby("name").agg({
-                "repetitions": "mean",
-                "ease_factor": "mean",
-                "id_card": "count"
-            }).rename(columns={"id_card": "Total Cards", "repetitions": "Avg Reps", "ease_factor": "Avg Ease"})
-            
-            st.dataframe(deck_stats, use_container_width=True)
-            
+            df_merged = pd.merge(df_cards, decks, left_on="deck_id", right_on="id")
+            st.dataframe(df_merged.groupby("name_y").agg({"repetitions": "mean", "ease_factor": "mean", "id_x": "count"}), use_container_width=True)
             if df_cards['last_reviewed'].notna().any():
-                st.subheader("Study Activity")
                 df_cards['last_reviewed'] = pd.to_datetime(df_cards['last_reviewed']).dt.date
                 activity = df_cards['last_reviewed'].value_counts().reset_index()
                 activity.columns = ['date', 'count']
-                
-                chart = alt.Chart(activity).mark_rect().encode(
-                    x=alt.X('date:O', title="Date"),
-                    y=alt.Y('count:Q', title="Cards Reviewed"),
-                    color=alt.Color('count', scale=alt.Scale(scheme='greens'))
-                ).properties(height=200)
-                st.altair_chart(chart, use_container_width=True)
-        else:
-            st.info("Start studying to see stats!")
+                st.altair_chart(alt.Chart(activity).mark_rect().encode(x='date:O', y='count:Q', color='count'), use_container_width=True)
 
-    with tab2:
-        st.subheader("Interactive Card Editor")
-        st.caption("Edit directly in the table. Changes are saved automatically.")
-        
+    with t2:
         if not df_cards.empty:
-            # Prepare df for editing
-            edit_df = df_cards[['id', 'front', 'back', 'explanation', 'tag']].copy()
-            
-            edited_df = st.data_editor(
-                edit_df,
-                hide_index=True,
-                use_container_width=True,
-                disabled=["id"]
-            )
-            
-            if st.button("💾 Save Changes to DB", type="primary"):
+            edited = st.data_editor(df_cards[['id', 'front', 'back', 'explanation', 'tag']], hide_index=True, use_container_width=True, disabled=["id"])
+            if st.button("💾 Save to DB", type="primary"):
                 with get_db_connection() as conn:
-                    c = conn.cursor()
-                    for _, row in edited_df.iterrows():
-                        c.execute("UPDATE cards SET front=?, back=?, explanation=?, tag=? WHERE id=?", 
-                                  (row['front'], row['back'], row['explanation'], row['tag'], row['id']))
+                    for _, r in edited.iterrows(): conn.execute("UPDATE cards SET front=?, back=?, explanation=?, tag=? WHERE id=?", (r['front'], r['back'], r['explanation'], r['tag'], r['id']))
                     conn.commit()
-                st.success("Database updated successfully!")
+                st.success("Updated!")
 
-    with tab3:
-        col_exp, col_info = st.columns([1, 2])
-        with col_exp:
-            export_deck_name = st.selectbox("Select Deck to Export", decks['name'].tolist())
-            
-            # Granular Export via Tags
-            deck_id_raw = decks[decks['name'] == export_deck_name].iloc[0]['id']
-            tags_in_deck = df_cards[df_cards['deck_id'] == deck_id_raw]['tag'].unique().tolist()
-            selected_tag = st.selectbox("Filter by Tag (Optional)", ["All"] + tags_in_deck)
+    with t3:
+        export_deck = st.selectbox("Export Deck", decks['name'].tolist())
+        deck_id_raw = decks[decks['name'] == export_deck].iloc[0]['id']
+        with get_db_connection() as conn: cards_df = pd.read_sql("SELECT front, back, tag FROM cards WHERE deck_id=?", conn, params=(int(deck_id_raw),))
+        st.download_button("Download CSV", data=cards_df.to_csv(index=False, header=False).encode('utf-8') if not cards_df.empty else b"", file_name=f"{export_deck}.csv", disabled=cards_df.empty)
 
-            csv_data = None
-            clean_filename = "anki_deck.csv"
-            
-            if export_deck_name:
-                clean_filename = re.sub(r'[^a-zA-Z0-9]', '_', export_deck_name) + "_anki.csv"
-                
-                query = "SELECT front, back, tag FROM cards WHERE deck_id=?"
-                params = [int(deck_id_raw)]
-                if selected_tag != "All":
-                    query += " AND tag=?"
-                    params.append(selected_tag)
+    with t4:
+        c1, c2 = st.columns(2)
+        with c1:
+            ren = st.selectbox("Rename", decks['name'].tolist(), key="r_sel")
+            new_n = st.text_input("New Name")
+            if st.button("Rename") and new_n:
+                if rename_deck(ren, new_n): st.success("Done!"); time.sleep(1); st.rerun()
+                else: st.error("Name exists.")
+        with c2:
+            d_del = st.selectbox("Delete", decks['name'].tolist(), key="d_sel")
+            if st.button(f"🗑️ Delete {d_del}"): delete_deck(d_del); st.rerun()
 
-                with get_db_connection() as conn:
-                    cards_df = pd.read_sql(query, conn, params=params)
-                
-                if not cards_df.empty:
-                    csv_data = cards_df.to_csv(index=False, header=False).encode('utf-8')
-                else:
-                    st.warning("Selected filter has no cards.")
-                
-            st.download_button(
-                label="Download Anki CSV",
-                data=csv_data if csv_data else b"Error", 
-                file_name=clean_filename,
-                mime="text/csv",
-                disabled=(csv_data is None),
-                key=f"dl_btn_{clean_filename}"
-            )
-        with col_info:
-            st.info("Import format: Front, Back, Tag. Compatible with standard Anki CSV import.")
-
-    with tab4:
-        col1, col2 = st.columns(2)
-        with col1:
-            st.subheader("Rename Deck")
-            deck_to_rename = st.selectbox("Select Deck", decks['name'].tolist(), key="rename_select")
-            new_deck_name = st.text_input("New Name")
-            if st.button("Rename"):
-                if new_deck_name:
-                    if rename_deck(deck_to_rename, new_deck_name):
-                        st.success("Renamed successfully!")
-                        time.sleep(1)
-                        st.rerun()
-                    else:
-                        st.error("A deck with that name already exists.")
-        
-        with col2:
-            st.subheader("Danger Zone")
-            deck_to_delete = st.selectbox("Select Deck to Delete", decks['name'].tolist(), key="del_select")
-            if st.button(f"🗑️ Delete '{deck_to_delete}' Permanently", type="primary"):
-                delete_deck(deck_to_delete)
-                st.toast(f"Deleted {deck_to_delete}")
-                time.sleep(1)
-                st.rerun()
-
-# ====================== 7. MAIN NAVIGATION ======================
 def main():
     inject_custom_css()
-    
     with st.sidebar:
         st.title("🧠 Flashcard Pro")
         api_key = st.text_input("Gemini API Key", type="password")
-        
-        # Sidebar Persistent Metric
-        due_count = get_due_cards_count()
-        st.metric("Cards Due Today", due_count)
-        
+        st.metric("Cards Due Today", get_due_cards_count())
         st.divider()
         page = st.radio("Navigation", ["Study Mode", "Generator", "Library & Stats"], label_visibility="collapsed")
-        
-        st.caption("v5.0 - Fully Loaded Edition")
+    
+    if page == "Generator": section_generator(api_key)
+    elif page == "Study Mode": section_study()
+    elif page == "Library & Stats": section_library()
 
-    if page == "Generator":
-        section_generator(api_key)
-    elif page == "Study Mode":
-        section_study()
-    elif page == "Library & Stats":
-        section_library()
-
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": main()
