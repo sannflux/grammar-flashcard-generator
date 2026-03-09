@@ -23,7 +23,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 # ====================== 1. SAFE IMPORTS & CONFIGURATION ======================
 st.set_page_config(
-    page_title="Flashcard Library Pro v5.3", 
+    page_title="Flashcard Library Pro v5.4", 
     page_icon="🧠", 
     layout="wide",
     initial_sidebar_state="expanded"
@@ -154,22 +154,31 @@ def extract_pdf_text(uploaded_file):
         return text[:25000] 
     except Exception as e: return f"Error reading PDF: {e}"
 
+def clean_web_markdown(text):
+    """Removes injected HTML error blocks and markdown images."""
+    # Remove raw HTML Access Denied blocks
+    text = re.sub(r'<HTML>.*?Access Denied.*?</HTML>', '', text, flags=re.IGNORECASE | re.DOTALL)
+    # Remove markdown images: ![alt](url)
+    text = re.sub(r'!\[.*?\]\(.*?\)', '', text)
+    # Remove empty lines left behind
+    text = re.sub(r'\n\s*\n', '\n\n', text)
+    return text.strip()
+
 def fetch_web_content(url):
     """Fetches web content using Jina Reader to bypass WAFs, with fallback."""
     try:
-        # Tier 1: Jina AI Reader API (Bypasses most Cloudflare/Akamai bots)
         jina_url = f"https://r.jina.ai/{url}"
         resp = requests.get(jina_url, timeout=15)
         resp.raise_for_status()
-        text = resp.text
         
-        # Check if Akamai still intercepted it via text pattern
-        if "Access Denied" in text and "permission to access" in text:
+        text = clean_web_markdown(resp.text)
+        
+        # If after cleaning, it's totally empty or still just an access denied message
+        if not text or ("Access Denied" in text and "permission to access" in text):
             raise ValueError("WAF")
             
         return text[:25000]
     except Exception:
-        # Tier 2: Fallback to standard request if Jina fails
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
