@@ -9,6 +9,8 @@ import json
 import time
 import io
 import base64
+import sys
+import os
 from datetime import datetime, timedelta
 import altair as alt
 
@@ -23,7 +25,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 # ====================== 1. SAFE IMPORTS & CONFIGURATION ======================
 st.set_page_config(
-    page_title="Flashcard Library Pro v5.7", 
+    page_title="Flashcard Library Pro v5.8", 
     page_icon="🧠", 
     layout="wide",
     initial_sidebar_state="expanded"
@@ -36,6 +38,7 @@ except ImportError:
     BS4_AVAILABLE = False
 
 try:
+    import youtube_transcript_api
     from youtube_transcript_api import YouTubeTranscriptApi
     YOUTUBE_AVAILABLE = True
 except ImportError:
@@ -147,7 +150,6 @@ def sanitize_json(text):
     return re.sub(r'^```', '', text, flags=re.MULTILINE).strip()
 
 def extract_pdf_text(uploaded_file):
-    """Safely extracts text and returns a tuple: (text_content, error_message)."""
     try:
         pdf_bytes = io.BytesIO(uploaded_file.getvalue())
         reader = PdfReader(pdf_bytes)
@@ -157,7 +159,6 @@ def extract_pdf_text(uploaded_file):
         return None, f"Error reading PDF: {str(e)}"
 
 def extract_youtube_id(url):
-    """Robustly extracts YouTube Video IDs from various URL formats."""
     parsed_url = urllib.parse.urlparse(url)
     if parsed_url.hostname == 'youtu.be':
         return parsed_url.path[1:]
@@ -166,78 +167,44 @@ def extract_youtube_id(url):
             return urllib.parse.parse_qs(parsed_url.query).get('v', [None])[0]
         if parsed_url.path.startswith(('/shorts/', '/embed/', '/v/')):
             return parsed_url.path.split('/')[2]
-    # Fallback Regex
     match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11}).*', url)
     return match.group(1) if match else None
 
 def clean_web_markdown(text):
-    """Aggressively removes injected HTML error blocks, markdown links, and tracking codes."""
     text = re.sub(r'<HTML.*?>.*?</HTML>', '', text, flags=re.IGNORECASE | re.DOTALL)
     text = re.sub(r'!\[.*?\]\(.*?\)', '', text)
     text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)
-    
     lines = text.split('\n')
-    clean_lines = []
-    for line in lines:
-        if "Access Denied" in line or "edgesuite.net" in line or "Reference #" in line:
-            continue
-        clean_lines.append(line)
-        
+    clean_lines = [line for line in lines if "Access Denied" not in line and "edgesuite.net" not in line and "Reference #" not in line]
     text = '\n'.join(clean_lines)
-    text = re.sub(r'\n\s*\n', '\n\n', text)
-    return text.strip()
+    return re.sub(r'\n\s*\n', '\n\n', text).strip()
 
 def fetch_web_content(url):
-    """Fetches web content using Jina Reader to bypass WAFs, with fallback."""
     try:
-        jina_url = f"https://r.jina.ai/{url}"
-        resp = requests.get(jina_url, timeout=15)
+        resp = requests.get(f"https://r.jina.ai/{url}", timeout=15)
         resp.raise_for_status()
-        
         text = clean_web_markdown(resp.text)
-        
-        if not text or (text.count("Access Denied") > 5 and len(text) < 1000):
-            raise ValueError("WAF")
-            
+        if not text or (text.count("Access Denied") > 5 and len(text) < 1000): raise ValueError("WAF")
         return text[:25000]
     except Exception:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-        }
+        headers = {"User-Agent": "Mozilla/5.0"}
         resp = requests.get(url, headers=headers, timeout=10)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.content, 'html.parser')
         for s in soup(["script", "style", "nav", "footer", "header"]): s.decompose()
-        text = " ".join(soup.stripped_strings)
-        return text[:25000]
+        return " ".join(soup.stripped_strings)[:25000]
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
 def generate_flashcards(api_key, text_content, image_content, difficulty, count_val):
     client = genai.Client(api_key=api_key)
-    system_prompt = f"""
-    Act as a professor for {difficulty} level students. 
-    Create {count_val} flashcards strictly based on the core educational content provided.
-    
-    CRITICAL INSTRUCTIONS:
-    - IGNORE website navigation menus, sidebars, 'Log in' prompts, and comment sections.
-    - Focus ONLY on the actual definitions, rules, or educational topics.
-    - Output JSON only. 'back' field MUST use <b>bold</b> tags for keywords.
-    """
-    
+    system_prompt = f"Act as a professor for {difficulty} level students. Create {count_val} flashcards strictly based on the core educational content provided. IGNORE website navigation menus, sidebars, 'Log in' prompts, and comment sections. Focus ONLY on the actual definitions, rules, or educational topics. Output JSON only. 'back' field MUST use <b>bold</b> tags for keywords."
     contents = []
     if text_content: contents.append(text_content)
     if image_content: contents.append(image_content)
-        
     response = client.models.generate_content(
         model="gemini-2.5-flash-lite", 
         contents=contents,
-        config=types.GenerateContentConfig(
-            system_instruction=system_prompt,
-            response_mime_type="application/json",
-            response_schema=FlashcardSet,
-            temperature=0.3
-        )
+        config=types.GenerateContentConfig(system_instruction=system_prompt, response_mime_type="application/json", response_schema=FlashcardSet, temperature=0.3)
     )
     return json.loads(sanitize_json(response.text)).get("cards", [])
 
@@ -281,14 +248,13 @@ def section_generator(api_key):
             if PDF_AVAILABLE:
                 pdf_file = st.file_uploader("Upload PDF Document", type=["pdf"])
                 if pdf_file:
-                    with st.spinner("Extracting text from PDF..."):
+                    with st.spinner("Extracting..."):
                         raw_text, error_msg = extract_pdf_text(pdf_file)
                         if not error_msg:
                             st.success(f"PDF Extracted! ({len(raw_text)} chars)")
-                            with st.expander("Preview & Edit Extracted Text", expanded=True):
-                                content_text = st.text_area("Edit text before generating:", raw_text, height=200)
-                        else: 
-                            st.error(error_msg)
+                            with st.expander("Preview & Edit", expanded=True):
+                                content_text = st.text_area("Edit text:", raw_text, height=200)
+                        else: st.error(error_msg)
             else: st.warning("Please install 'pypdf'")
             
         elif source_type == "Image Analysis":
@@ -306,21 +272,24 @@ def section_generator(api_key):
                         try:
                             video_id = extract_youtube_id(url)
                             if not video_id:
-                                raise ValueError("Could not detect a valid YouTube Video ID from the provided URL.")
+                                raise ValueError("Invalid YouTube URL.")
                             
-                            # FIX 3: Robust fetching using list_transcripts
-                            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-                            try:
-                                transcript = transcript_list.find_transcript(['en']).fetch()
-                            except:
-                                transcript = list(transcript_list)[0].fetch()
-
-                            raw_text = " ".join([t['text'] for t in transcript])
+                            # Self-Diagnostic Engine
+                            if hasattr(youtube_transcript_api, '__file__'):
+                                mod_path = youtube_transcript_api.__file__
+                                if 'site-packages' not in mod_path and os.getcwd() in mod_path:
+                                    st.error(f"🚨 CRITICAL ENVIRONMENT ERROR 🚨\nYou have a local file named `youtube_transcript_api.py` located at: \n`{mod_path}`\n\nThis is shadowing the real library! Please delete or rename this file and restart Streamlit.")
+                                    st.stop()
+                            
+                            # Official Call
+                            raw_text = " ".join([t['text'] for t in YouTubeTranscriptApi.get_transcript(video_id)])
                             st.success("Transcript Extracted!")
-                            with st.expander("Preview & Edit Transcript", expanded=True):
-                                content_text = st.text_area("Edit text before generating:", raw_text, height=200)
+                            with st.expander("Preview & Edit", expanded=True):
+                                content_text = st.text_area("Edit text:", raw_text, height=200)
+                        except AttributeError as ae:
+                            st.error(f"Environment Error: The library is corrupted. Try running: `pip uninstall youtube-transcript-api` then `pip install youtube-transcript-api`")
                         except Exception as e: 
-                            st.error(f"Error fetching transcript: {str(e)}")
+                            st.error(f"Error: {str(e)}")
             else: st.warning("Install youtube-transcript-api")
 
         elif source_type == "Web Article":
@@ -330,8 +299,8 @@ def section_generator(api_key):
                     try:
                         raw_text = fetch_web_content(url)
                         st.success("Web Content Extracted!")
-                        with st.expander("Preview & Edit Web Content", expanded=True):
-                            content_text = st.text_area("Edit text before generating (Note: AI will automatically ignore menus and comments):", raw_text, height=200)
+                        with st.expander("Preview & Edit", expanded=True):
+                            content_text = st.text_area("Edit text:", raw_text, height=200)
                     except Exception as e: st.error(str(e))
 
     with col_sets:
@@ -471,15 +440,8 @@ def section_library():
     with t1:
         if not df_cards.empty:
             df_merged = pd.merge(df_cards, decks, left_on="deck_id", right_on="id", suffixes=('_card', '_deck'))
-            
-            stats_df = df_merged.groupby("name").agg({
-                "repetitions": "mean", 
-                "ease_factor": "mean", 
-                "id_card": "count"
-            }).rename(columns={"id_card": "Total Cards", "repetitions": "Avg Reps", "ease_factor": "Avg Ease"})
-            
+            stats_df = df_merged.groupby("name").agg({"repetitions": "mean", "ease_factor": "mean", "id_card": "count"}).rename(columns={"id_card": "Total Cards", "repetitions": "Avg Reps", "ease_factor": "Avg Ease"})
             st.dataframe(stats_df, use_container_width=True)
-            
             if df_cards['last_reviewed'].notna().any():
                 df_cards['last_reviewed'] = pd.to_datetime(df_cards['last_reviewed']).dt.date
                 activity = df_cards['last_reviewed'].value_counts().reset_index()
