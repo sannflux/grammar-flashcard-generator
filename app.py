@@ -23,7 +23,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 # ====================== 1. SAFE IMPORTS & CONFIGURATION ======================
 st.set_page_config(
-    page_title="Flashcard Library Pro v5.1", 
+    page_title="Flashcard Library Pro v5.2", 
     page_icon="🧠", 
     layout="wide",
     initial_sidebar_state="expanded"
@@ -155,21 +155,36 @@ def extract_pdf_text(uploaded_file):
     except Exception as e: return f"Error reading PDF: {e}"
 
 def fetch_web_content(url):
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
+    # Tier 1: Standard Chrome Header
+    headers_chrome = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.5"
     }
+    # Tier 2: Googlebot Header (often bypasses WAF)
+    headers_googlebot = {
+        "User-Agent": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    }
+    
     try:
-        resp = requests.get(url, headers=headers, timeout=10)
+        resp = requests.get(url, headers=headers_chrome, timeout=10)
         resp.raise_for_status()
         return resp.content
     except requests.exceptions.RequestException:
-        # Fallback Proxy for strict sites like British Council
-        proxy_url = f"https://api.allorigins.win/raw?url={urllib.parse.quote(url)}"
-        resp = requests.get(proxy_url, timeout=15)
-        resp.raise_for_status()
-        return resp.content
+        try:
+            resp = requests.get(url, headers=headers_googlebot, timeout=10)
+            resp.raise_for_status()
+            return resp.content
+        except requests.exceptions.RequestException:
+            try:
+                # Tier 3: Faster proxy service
+                proxy_url = f"https://api.codetabs.com/v1/proxy/?quest={urllib.parse.quote(url)}"
+                resp = requests.get(proxy_url, timeout=15)
+                resp.raise_for_status()
+                return resp.content
+            except requests.exceptions.RequestException:
+                raise Exception("Site is heavily protected against bots. Please copy the text manually and use the 'Text/Paste' option.")
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
 def generate_flashcards(api_key, text_content, image_content, difficulty, count_val):
@@ -275,7 +290,7 @@ def section_generator(api_key):
                             st.success("Web Content Extracted!")
                             with st.expander("Preview & Edit Web Content", expanded=True):
                                 content_text = st.text_area("Edit text before generating:", raw_text, height=200)
-                        except Exception as e: st.error(f"Error: {e}")
+                        except Exception as e: st.error(str(e))
             else: st.warning("Install beautifulsoup4")
 
     with col_sets:
