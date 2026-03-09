@@ -9,6 +9,7 @@ import json
 import time
 import io
 import base64
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 import altair as alt
 
@@ -23,7 +24,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 # ====================== 1. SAFE IMPORTS & CONFIGURATION ======================
 st.set_page_config(
-    page_title="Flashcard Library Pro v6.2", 
+    page_title="Flashcard Library Pro v6.3", 
     page_icon="🧠", 
     layout="wide",
     initial_sidebar_state="expanded"
@@ -61,7 +62,7 @@ for key, value in DEFAULT_STATE.items():
         st.session_state[key] = value
 
 # ====================== 2. DATABASE ENGINE ======================
-DB_NAME = "flashcards_v5.db" # Keeping same DB name to preserve user data
+DB_NAME = "flashcards_v5.db"
 
 def get_db_connection():
     conn = sqlite3.connect(DB_NAME, check_same_thread=False)
@@ -78,18 +79,16 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT, deck_id INTEGER, front TEXT, back TEXT, 
             explanation TEXT, tag TEXT, ease_factor REAL DEFAULT 2.5, interval INTEGER DEFAULT 0,
             repetitions INTEGER DEFAULT 0, next_review TEXT DEFAULT CURRENT_DATE, last_reviewed TEXT,
+            card_type TEXT DEFAULT 'Basic',
             FOREIGN KEY(deck_id) REFERENCES decks(id) ON DELETE CASCADE)''')
         
         # Safe Migrations
         try: c.execute("SELECT explanation FROM cards LIMIT 1")
         except sqlite3.OperationalError: c.execute("ALTER TABLE cards ADD COLUMN explanation TEXT DEFAULT ''")
-        
         try: c.execute("SELECT last_reviewed FROM cards LIMIT 1")
         except sqlite3.OperationalError: c.execute("ALTER TABLE cards ADD COLUMN last_reviewed TEXT")
-        
         try: c.execute("SELECT card_type FROM cards LIMIT 1")
         except sqlite3.OperationalError: c.execute("ALTER TABLE cards ADD COLUMN card_type TEXT DEFAULT 'Basic'")
-        
         conn.commit()
 
 init_db()
@@ -186,6 +185,21 @@ def fetch_web_content(url):
         soup = BeautifulSoup(resp.content, 'html.parser')
         for s in soup(["script", "style", "nav", "footer", "header"]): s.decompose()
         return " ".join(soup.stripped_strings)[:25000]
+
+def fallback_youtube_extractor(video_id):
+    """Direct HTTP fallback if youtube-transcript-api fails."""
+    try:
+        url = f"https://www.youtube.com/watch?v={video_id}"
+        html = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}).text
+        match = re.search(r'"captionTracks":\[\{"baseUrl":"([^"]+)"', html)
+        if match:
+            caption_url = match.group(1).replace("\\u0026", "&")
+            xml_data = requests.get(caption_url).text
+            root = ET.fromstring(xml_data)
+            return " ".join([child.text for child in root if child.text])
+        return None
+    except Exception:
+        return None
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
 def generate_flashcards(api_key, text_content, image_content, difficulty, count_val, card_type):
@@ -292,35 +306,37 @@ def section_generator(api_key):
                 content_text = "Generate flashcards based on this image."
 
         elif source_type == "YouTube URL":
-            if YOUTUBE_AVAILABLE:
-                url = st.text_input("Video URL")
-                if url:
-                    with st.spinner("Transcribing..."):
-                        try:
-                            # 1. Regex to robustly grab the 11-char video ID from any format
-                            match = re.search(r'(?:v=|youtu\.be\/|shorts\/|embed\/)([0-9A-Za-z_-]{11})', url)
-                            if not match:
-                                raise ValueError("Could not extract a valid 11-character YouTube Video ID from the URL.")
-                            video_id = match.group(1)
-                            
-                            # 2. Try official method, fallback to older/unofficial methods
-                            raw_transcript = None
+            url = st.text_input("Video URL")
+            if url:
+                with st.spinner("Transcribing..."):
+                    try:
+                        match = re.search(r'(?:v=|youtu\.be\/|shorts\/|embed\/)([0-9A-Za-z_-]{11})', url)
+                        if not match:
+                            raise ValueError("Could not extract a valid 11-character YouTube Video ID from the URL.")
+                        video_id = match.group(1)
+                        
+                        raw_text = None
+                        # Method 1: Try package
+                        if YOUTUBE_AVAILABLE:
                             try:
                                 raw_transcript = YouTubeTranscriptApi.get_transcript(video_id)
-                            except AttributeError:
-                                try:
-                                    raw_transcript = YouTubeTranscriptApi.getTranscript(video_id)
-                                except Exception:
-                                    raise ValueError("Your 'youtube-transcript-api' package is incorrect/outdated. Run: pip install --upgrade youtube-transcript-api")
+                                raw_text = " ".join([t['text'] for t in raw_transcript])
+                            except Exception:
+                                pass # Fall through to method 2
+                                
+                        # Method 2: Raw HTTP Fallback
+                        if not raw_text:
+                            raw_text = fallback_youtube_extractor(video_id)
                             
-                            raw_text = " ".join([t['text'] for t in raw_transcript])
+                        if raw_text:
                             st.success("Transcript Extracted!")
                             with st.expander("Preview & Edit Transcript", expanded=True):
                                 content_text = st.text_area("Edit text before generating:", raw_text, height=200)
-                                
-                        except Exception as e: 
-                            st.error(f"Error: {e}")
-            else: st.warning("Install youtube-transcript-api")
+                        else:
+                            st.error("Failed to extract transcript. The video might not have captions enabled.")
+                            
+                    except Exception as e: 
+                        st.error(f"Error: {e}")
 
         elif source_type == "Web Article":
             url = st.text_input("Article URL")
@@ -330,7 +346,7 @@ def section_generator(api_key):
                         raw_text = fetch_web_content(url)
                         st.success("Web Content Extracted!")
                         with st.expander("Preview & Edit Web Content", expanded=True):
-                            content_text = st.text_area("Edit text before generating:", raw_text, height=200)
+                            content_text = st.text_area("Edit text before generating (Note: AI will automatically ignore menus and comments):", raw_text, height=200)
                     except Exception as e: st.error(str(e))
 
     with col_sets:
