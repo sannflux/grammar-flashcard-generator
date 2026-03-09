@@ -10,6 +10,7 @@ import time
 import io
 import base64
 import os
+import html
 from datetime import datetime, timedelta
 import altair as alt
 
@@ -24,7 +25,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 # ====================== 1. SAFE IMPORTS & CONFIGURATION ======================
 st.set_page_config(
-    page_title="Flashcard Library Pro v5.9", 
+    page_title="Flashcard Library Pro v6.0", 
     page_icon="🧠", 
     layout="wide",
     initial_sidebar_state="expanded"
@@ -168,6 +169,24 @@ def extract_youtube_id(url):
     match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11}).*', url)
     return match.group(1) if match else None
 
+def get_native_youtube_transcript(video_id):
+    """Zero-dependency extractor: fetches the raw XML subtitle track from YouTube's backend."""
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    resp = requests.get(f"https://www.youtube.com/watch?v={video_id}", headers=headers)
+    
+    # Locate the hidden caption track URL inside the YouTube page source
+    match = re.search(r'"captionTracks":\[\{"baseUrl":"([^"]+)"', resp.text)
+    if not match:
+        raise ValueError("No closed captions exist for this video.")
+        
+    xml_url = match.group(1).replace('\\u0026', '&')
+    xml_resp = requests.get(xml_url, headers=headers)
+    
+    # Strip the XML timestamps (<text start="1.0">Hello</text> -> Hello)
+    clean_text = re.sub(r'<[^>]+>', ' ', xml_resp.text)
+    clean_text = html.unescape(clean_text)
+    return re.sub(r'\s+', ' ', clean_text).strip()
+
 def clean_web_markdown(text):
     text = re.sub(r'<HTML.*?>.*?</HTML>', '', text, flags=re.IGNORECASE | re.DOTALL)
     text = re.sub(r'!\[.*?\]\(.*?\)', '', text)
@@ -272,32 +291,23 @@ def section_generator(api_key):
                             raise ValueError("Invalid YouTube URL.")
                         
                         raw_text = ""
-                        fallback_triggered = False
-                        
-                        # Plan A: Local Library
+                        # Attempt Plan A: Local Library
                         if YOUTUBE_AVAILABLE:
                             try:
                                 raw_text = " ".join([t['text'] for t in YouTubeTranscriptApi.get_transcript(video_id)])
                             except Exception:
-                                fallback_triggered = True
-                        else:
-                            fallback_triggered = True
-                            
-                        # Plan B: Cloud Scraper (Bypasses local library corruption)
-                        if fallback_triggered:
-                            raw_text = fetch_web_content(url)
-                            if not raw_text or len(raw_text) < 50:
-                                raise ValueError("Both local extraction and cloud fallback failed to read the transcript.")
+                                pass # Library failed (corrupted environment), move to Plan B
                         
-                        st.success("Transcript Extracted!")
-                        if fallback_triggered:
-                            st.caption("⚡ Extracted via Cloud Fallback Engine")
-                            
-                        with st.expander("Preview & Edit", expanded=True):
-                            content_text = st.text_area("Edit text:", raw_text, height=200)
+                        # Attempt Plan B: Native XML Extractor (Zero Dependencies)
+                        if not raw_text:
+                            raw_text = get_native_youtube_transcript(video_id)
+                        
+                        st.success("Transcript Extracted Successfully!")
+                        with st.expander("Preview & Edit Transcript", expanded=True):
+                            content_text = st.text_area("Edit text before generating:", raw_text, height=200)
                             
                     except Exception as e: 
-                        st.error(f"Error fetching transcript: {str(e)}")
+                        st.error(f"Error extracting transcript: {str(e)}")
 
         elif source_type == "Web Article":
             url = st.text_input("Article URL")
