@@ -9,7 +9,6 @@ import json
 import time
 import io
 import base64
-import sys
 import os
 from datetime import datetime, timedelta
 import altair as alt
@@ -25,7 +24,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 # ====================== 1. SAFE IMPORTS & CONFIGURATION ======================
 st.set_page_config(
-    page_title="Flashcard Library Pro v5.8", 
+    page_title="Flashcard Library Pro v5.9", 
     page_icon="🧠", 
     layout="wide",
     initial_sidebar_state="expanded"
@@ -38,7 +37,6 @@ except ImportError:
     BS4_AVAILABLE = False
 
 try:
-    import youtube_transcript_api
     from youtube_transcript_api import YouTubeTranscriptApi
     YOUTUBE_AVAILABLE = True
 except ImportError:
@@ -265,32 +263,41 @@ def section_generator(api_key):
                 content_text = "Generate flashcards based on this image."
 
         elif source_type == "YouTube URL":
-            if YOUTUBE_AVAILABLE:
-                url = st.text_input("Video URL")
-                if url:
-                    with st.spinner("Transcribing..."):
-                        try:
-                            video_id = extract_youtube_id(url)
-                            if not video_id:
-                                raise ValueError("Invalid YouTube URL.")
+            url = st.text_input("Video URL")
+            if url:
+                with st.spinner("Transcribing..."):
+                    try:
+                        video_id = extract_youtube_id(url)
+                        if not video_id:
+                            raise ValueError("Invalid YouTube URL.")
+                        
+                        raw_text = ""
+                        fallback_triggered = False
+                        
+                        # Plan A: Local Library
+                        if YOUTUBE_AVAILABLE:
+                            try:
+                                raw_text = " ".join([t['text'] for t in YouTubeTranscriptApi.get_transcript(video_id)])
+                            except Exception:
+                                fallback_triggered = True
+                        else:
+                            fallback_triggered = True
                             
-                            # Self-Diagnostic Engine
-                            if hasattr(youtube_transcript_api, '__file__'):
-                                mod_path = youtube_transcript_api.__file__
-                                if 'site-packages' not in mod_path and os.getcwd() in mod_path:
-                                    st.error(f"🚨 CRITICAL ENVIRONMENT ERROR 🚨\nYou have a local file named `youtube_transcript_api.py` located at: \n`{mod_path}`\n\nThis is shadowing the real library! Please delete or rename this file and restart Streamlit.")
-                                    st.stop()
+                        # Plan B: Cloud Scraper (Bypasses local library corruption)
+                        if fallback_triggered:
+                            raw_text = fetch_web_content(url)
+                            if not raw_text or len(raw_text) < 50:
+                                raise ValueError("Both local extraction and cloud fallback failed to read the transcript.")
+                        
+                        st.success("Transcript Extracted!")
+                        if fallback_triggered:
+                            st.caption("⚡ Extracted via Cloud Fallback Engine")
                             
-                            # Official Call
-                            raw_text = " ".join([t['text'] for t in YouTubeTranscriptApi.get_transcript(video_id)])
-                            st.success("Transcript Extracted!")
-                            with st.expander("Preview & Edit", expanded=True):
-                                content_text = st.text_area("Edit text:", raw_text, height=200)
-                        except AttributeError as ae:
-                            st.error(f"Environment Error: The library is corrupted. Try running: `pip uninstall youtube-transcript-api` then `pip install youtube-transcript-api`")
-                        except Exception as e: 
-                            st.error(f"Error: {str(e)}")
-            else: st.warning("Install youtube-transcript-api")
+                        with st.expander("Preview & Edit", expanded=True):
+                            content_text = st.text_area("Edit text:", raw_text, height=200)
+                            
+                    except Exception as e: 
+                        st.error(f"Error fetching transcript: {str(e)}")
 
         elif source_type == "Web Article":
             url = st.text_input("Article URL")
