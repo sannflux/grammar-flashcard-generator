@@ -128,11 +128,6 @@ def get_due_cards_count():
     with get_db_connection() as conn:
         return conn.execute("SELECT COUNT(*) FROM cards WHERE next_review <= ?", (today,)).fetchone()[0]
 
-def extract_youtube_id(url):
-    """Safely extracts YouTube ID from various URL formats."""
-    match = re.search(r'(?:v=|/)([0-9A-Za-z_-]{11}).*', url)
-    return match.group(1) if match else None
-
 # ====================== 4. AI CONTENT ENGINE & EXTRACTORS ======================
 class Flashcard(BaseModel):
     front: str = Field(description="The question/concept. Plain text.")
@@ -151,10 +146,9 @@ def sanitize_json(text):
     text = re.sub(r'^```json', '', text, flags=re.MULTILINE)
     return re.sub(r'^```', '', text, flags=re.MULTILINE).strip()
 
-@st.cache_data(show_spinner=False)
-def extract_pdf_text(file_bytes):
+def extract_pdf_text(uploaded_file):
     try:
-        pdf_bytes = io.BytesIO(file_bytes)
+        pdf_bytes = io.BytesIO(uploaded_file.getvalue())
         reader = PdfReader(pdf_bytes)
         text = "".join(page.extract_text() + "\n" for page in reader.pages)
         return text[:25000] 
@@ -177,7 +171,6 @@ def clean_web_markdown(text):
     text = re.sub(r'\n\s*\n', '\n\n', text)
     return text.strip()
 
-@st.cache_data(show_spinner=False)
 def fetch_web_content(url):
     """Fetches web content using Jina Reader to bypass WAFs, with fallback."""
     try:
@@ -273,8 +266,7 @@ def section_generator(api_key):
                 pdf_file = st.file_uploader("Upload PDF Document", type=["pdf"])
                 if pdf_file:
                     with st.spinner("Extracting text from PDF..."):
-                        # Now safely cached using bytes to prevent reruns killing performance
-                        raw_text = extract_pdf_text(pdf_file.getvalue())
+                        raw_text = extract_pdf_text(pdf_file)
                         if "Error" not in raw_text:
                             st.success(f"PDF Extracted! ({len(raw_text)} chars)")
                             with st.expander("Preview & Edit Extracted Text", expanded=True):
@@ -295,14 +287,11 @@ def section_generator(api_key):
                 if url:
                     with st.spinner("Transcribing..."):
                         try:
-                            video_id = extract_youtube_id(url)
-                            if not video_id:
-                                st.error("Invalid YouTube URL.")
-                            else:
-                                raw_text = " ".join([t['text'] for t in YouTubeTranscriptApi.get_transcript(video_id)])
-                                st.success("Transcript Extracted!")
-                                with st.expander("Preview & Edit Transcript", expanded=True):
-                                    content_text = st.text_area("Edit text before generating:", raw_text, height=200)
+                            video_id = url.split("v=")[1].split("&")[0]
+                            raw_text = " ".join([t['text'] for t in YouTubeTranscriptApi.get_transcript(video_id)])
+                            st.success("Transcript Extracted!")
+                            with st.expander("Preview & Edit Transcript", expanded=True):
+                                content_text = st.text_area("Edit text before generating:", raw_text, height=200)
                         except Exception as e: st.error(f"Error: {e}")
             else: st.warning("Install youtube-transcript-api")
 
@@ -453,6 +442,7 @@ def section_library():
 
     with t1:
         if not df_cards.empty:
+            # FIX: Use explicit suffixes to prevent KeyError
             df_merged = pd.merge(df_cards, decks, left_on="deck_id", right_on="id", suffixes=('_card', '_deck'))
             
             stats_df = df_merged.groupby("name").agg({
@@ -471,24 +461,12 @@ def section_library():
 
     with t2:
         if not df_cards.empty:
-            # Replaced with a proper mapped key to prevent state-wipes during interactions
-            edited = st.data_editor(df_cards[['id', 'front', 'back', 'explanation', 'tag']], hide_index=True, use_container_width=True, disabled=["id"], key="library_editor")
-            
-            # Optimization: Only update rows that actually changed
+            edited = st.data_editor(df_cards[['id', 'front', 'back', 'explanation', 'tag']], hide_index=True, use_container_width=True, disabled=["id"])
             if st.button("💾 Save to DB", type="primary"):
-                changes = st.session_state["library_editor"].get("edited_rows", {})
-                if changes:
-                    with get_db_connection() as conn:
-                        for row_idx, updates in changes.items():
-                            card_id = df_cards.iloc[row_idx]['id']
-                            for col, val in updates.items():
-                                conn.execute(f"UPDATE cards SET {col}=? WHERE id=?", (val, int(card_id)))
-                        conn.commit()
-                    st.success("Updated Successfully!")
-                    time.sleep(1)
-                    st.rerun()
-                else:
-                    st.info("No changes to save.")
+                with get_db_connection() as conn:
+                    for _, r in edited.iterrows(): conn.execute("UPDATE cards SET front=?, back=?, explanation=?, tag=? WHERE id=?", (r['front'], r['back'], r['explanation'], r['tag'], r['id']))
+                    conn.commit()
+                st.success("Updated!")
 
     with t3:
         export_deck = st.selectbox("Export Deck", decks['name'].tolist())
