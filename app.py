@@ -25,7 +25,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 # ====================== 1. SAFE IMPORTS & CONFIGURATION ======================
 st.set_page_config(
-    page_title="Flashcard Library Pro v6.2", 
+    page_title="Flashcard Library Pro v6.3", 
     page_icon="🧠", 
     layout="wide",
     initial_sidebar_state="expanded"
@@ -170,33 +170,39 @@ def extract_youtube_id(url):
     return match.group(1) if match else None
 
 def get_native_youtube_transcript(video_id):
-    """Zero-dependency extractor with Bot-Bypass Cookies."""
+    """Multi-stage YouTube Extractor."""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept-Language": "en-US,en;q=0.9",
     }
-    # This cookie tells YouTube we already consented, bypassing the bot wall
     cookies = {"CONSENT": "YES+cb.20210328-17-p0.en+FX+478"} 
     
-    html_content = requests.get(f"https://www.youtube.com/watch?v={video_id}", headers=headers, cookies=cookies).text
-    
-    # Locate the hidden JSON array containing the caption tracks
-    captions_match = re.search(r'"captionTracks":(\[.*?\])', html_content)
-    if not captions_match:
-        raise ValueError("No closed captions exist for this video, or it is age-restricted.")
-        
+    # --- STAGE 1: NATIVE HTML PARSE (Forgiving Regex) ---
     try:
-        captions_json = json.loads(captions_match.group(1))
-        # Default to the first available transcript
-        transcript_url = captions_json[0]['baseUrl']
-    except (json.JSONDecodeError, IndexError, KeyError):
-        raise ValueError("Failed to parse YouTube caption data.")
+        html_content = requests.get(f"https://www.youtube.com/watch?v={video_id}", headers=headers, cookies=cookies, timeout=10).text
+        # Forgiving regex looking for "captionTracks" with optional spaces
+        captions_match = re.search(r'"captionTracks"\s*:\s*(\[.*?\])', html_content)
+        if captions_match:
+            captions_json = json.loads(captions_match.group(1))
+            xml_url = captions_json[0]['baseUrl']
+            xml_resp = requests.get(xml_url, headers=headers, timeout=10)
+            clean_text = re.sub(r'<[^>]+>', ' ', xml_resp.text)
+            clean_text = html.unescape(clean_text)
+            return re.sub(r'\s+', ' ', clean_text).strip()
+    except Exception:
+        pass # Fallback to Stage 2
         
-    # Fetch the raw XML and clean it
-    xml_resp = requests.get(transcript_url, headers=headers)
-    clean_text = re.sub(r'<[^>]+>', ' ', xml_resp.text)
-    clean_text = html.unescape(clean_text)
-    return re.sub(r'\s+', ' ', clean_text).strip()
+    # --- STAGE 2: PROXY API FALLBACK ---
+    try:
+        proxy_resp = requests.get(f"https://youtubetranscript.com/?server_vid2={video_id}", timeout=10)
+        if '<transcript>' in proxy_resp.text or '<?xml' in proxy_resp.text:
+            clean_text = re.sub(r'<[^>]+>', ' ', proxy_resp.text)
+            clean_text = html.unescape(clean_text)
+            return re.sub(r'\s+', ' ', clean_text).strip()
+    except Exception:
+        pass
+        
+    raise ValueError("All extraction methods failed. The video may not have closed captions.")
 
 def clean_web_markdown(text):
     text = re.sub(r'<HTML.*?>.*?</HTML>', '', text, flags=re.IGNORECASE | re.DOTALL)
@@ -302,14 +308,14 @@ def section_generator(api_key):
                             raise ValueError("Invalid YouTube URL.")
                         
                         raw_text = ""
-                        # Attempt Plan A: Local Library
+                        # Plan A: Library
                         if YOUTUBE_AVAILABLE:
                             try:
                                 raw_text = " ".join([t['text'] for t in YouTubeTranscriptApi.get_transcript(video_id)])
                             except Exception:
-                                pass # Move to Plan B
+                                pass
                         
-                        # Attempt Plan B: Native JSON Parsing Extractor with Bot Bypass
+                        # Plan B & C: Custom Extractor
                         if not raw_text:
                             raw_text = get_native_youtube_transcript(video_id)
                         
