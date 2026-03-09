@@ -23,7 +23,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 # ====================== 1. SAFE IMPORTS & CONFIGURATION ======================
 st.set_page_config(
-    page_title="Flashcard Library Pro v5.6", 
+    page_title="Flashcard Library Pro v5.7", 
     page_icon="🧠", 
     layout="wide",
     initial_sidebar_state="expanded"
@@ -282,7 +282,6 @@ def section_generator(api_key):
                 pdf_file = st.file_uploader("Upload PDF Document", type=["pdf"])
                 if pdf_file:
                     with st.spinner("Extracting text from PDF..."):
-                        # FIX 1: Using the tuple extraction method
                         raw_text, error_msg = extract_pdf_text(pdf_file)
                         if not error_msg:
                             st.success(f"PDF Extracted! ({len(raw_text)} chars)")
@@ -305,12 +304,18 @@ def section_generator(api_key):
                 if url:
                     with st.spinner("Transcribing..."):
                         try:
-                            # FIX 2: Using the robust URL extractor
                             video_id = extract_youtube_id(url)
                             if not video_id:
                                 raise ValueError("Could not detect a valid YouTube Video ID from the provided URL.")
-                                
-                            raw_text = " ".join([t['text'] for t in YouTubeTranscriptApi.get_transcript(video_id)])
+                            
+                            # FIX 3: Robust fetching using list_transcripts
+                            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+                            try:
+                                transcript = transcript_list.find_transcript(['en']).fetch()
+                            except:
+                                transcript = list(transcript_list)[0].fetch()
+
+                            raw_text = " ".join([t['text'] for t in transcript])
                             st.success("Transcript Extracted!")
                             with st.expander("Preview & Edit Transcript", expanded=True):
                                 content_text = st.text_area("Edit text before generating:", raw_text, height=200)
