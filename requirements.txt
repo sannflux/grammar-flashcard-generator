@@ -1,13 +1,11 @@
-streamlit
+streamlit>=1.30.0
 pandas
-sqlite3
-requests
 altair
-google-generativeai  # Corrected from google-genai for accuracy
+google-genai
 pydantic
-pillow
-gtts
-tenacity
 beautifulsoup4
-youtube-transcript-api  # No version pin to get latest (1.2.x+) with proxy support
+youtube-transcript-api>=0.6.2
 pypdf
+Pillow
+gTTS
+tenacity
