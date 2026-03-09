@@ -23,7 +23,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 # ====================== 1. SAFE IMPORTS & CONFIGURATION ======================
 st.set_page_config(
-    page_title="Flashcard Library Pro v5.2", 
+    page_title="Flashcard Library Pro v5.3", 
     page_icon="🧠", 
     layout="wide",
     initial_sidebar_state="expanded"
@@ -155,36 +155,35 @@ def extract_pdf_text(uploaded_file):
     except Exception as e: return f"Error reading PDF: {e}"
 
 def fetch_web_content(url):
-    # Tier 1: Standard Chrome Header
-    headers_chrome = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5"
-    }
-    # Tier 2: Googlebot Header (often bypasses WAF)
-    headers_googlebot = {
-        "User-Agent": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-    }
-    
+    """Fetches web content using Jina Reader to bypass WAFs, with fallback."""
     try:
-        resp = requests.get(url, headers=headers_chrome, timeout=10)
+        # Tier 1: Jina AI Reader API (Bypasses most Cloudflare/Akamai bots)
+        jina_url = f"https://r.jina.ai/{url}"
+        resp = requests.get(jina_url, timeout=15)
         resp.raise_for_status()
-        return resp.content
-    except requests.exceptions.RequestException:
-        try:
-            resp = requests.get(url, headers=headers_googlebot, timeout=10)
-            resp.raise_for_status()
-            return resp.content
-        except requests.exceptions.RequestException:
-            try:
-                # Tier 3: Faster proxy service
-                proxy_url = f"https://api.codetabs.com/v1/proxy/?quest={urllib.parse.quote(url)}"
-                resp = requests.get(proxy_url, timeout=15)
-                resp.raise_for_status()
-                return resp.content
-            except requests.exceptions.RequestException:
-                raise Exception("Site is heavily protected against bots. Please copy the text manually and use the 'Text/Paste' option.")
+        text = resp.text
+        
+        # Check if Akamai still intercepted it via text pattern
+        if "Access Denied" in text and "permission to access" in text:
+            raise ValueError("WAF")
+            
+        return text[:25000]
+    except Exception:
+        # Tier 2: Fallback to standard request if Jina fails
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        }
+        resp = requests.get(url, headers=headers, timeout=10)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.content, 'html.parser')
+        for s in soup(["script", "style", "nav", "footer", "header"]): s.decompose()
+        text = " ".join(soup.stripped_strings)
+        
+        if "Access Denied" in text and "permission to access" in text:
+            raise Exception("Site is heavily protected by enterprise firewalls (Akamai). Please copy the text manually and use 'Text/Paste'.")
+            
+        return text[:25000]
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
 def generate_flashcards(api_key, text_content, image_content, difficulty, count_val):
@@ -278,20 +277,15 @@ def section_generator(api_key):
             else: st.warning("Install youtube-transcript-api")
 
         elif source_type == "Web Article":
-            if BS4_AVAILABLE:
-                url = st.text_input("Article URL")
-                if url:
-                    with st.spinner("Fetching Webpage..."):
-                        try:
-                            html_content = fetch_web_content(url)
-                            soup = BeautifulSoup(html_content, 'html.parser')
-                            for s in soup(["script", "style", "nav", "footer", "header"]): s.decompose()
-                            raw_text = " ".join(soup.stripped_strings)[:25000]
-                            st.success("Web Content Extracted!")
-                            with st.expander("Preview & Edit Web Content", expanded=True):
-                                content_text = st.text_area("Edit text before generating:", raw_text, height=200)
-                        except Exception as e: st.error(str(e))
-            else: st.warning("Install beautifulsoup4")
+            url = st.text_input("Article URL")
+            if url:
+                with st.spinner("Fetching Webpage..."):
+                    try:
+                        raw_text = fetch_web_content(url)
+                        st.success("Web Content Extracted!")
+                        with st.expander("Preview & Edit Web Content", expanded=True):
+                            content_text = st.text_area("Edit text before generating:", raw_text, height=200)
+                    except Exception as e: st.error(str(e))
 
     with col_sets:
         st.subheader("Config")
