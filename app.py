@@ -24,7 +24,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 # ====================== 1. SAFE IMPORTS & CONFIGURATION ======================
 st.set_page_config(
-    page_title="Flashcard Library Pro v6.4", 
+    page_title="Flashcard Library Pro v6.5", 
     page_icon="🧠", 
     layout="wide",
     initial_sidebar_state="expanded"
@@ -162,7 +162,8 @@ def extract_pdf_text(uploaded_file):
                 text += page_text + "\n"
                 
         if not text.strip():
-            return "Error: This PDF appears to be an image/scan with no readable text layer."
+            # FIX: Return a tuple so it doesn't crash Python's unpacking
+            return "Error: This PDF appears to be an image/scan with no readable text layer.", 0
             
         return text[:25000], len(reader.pages)
     except Exception as e: 
@@ -196,17 +197,12 @@ def fetch_web_content(url):
         return " ".join(soup.stripped_strings)[:25000]
 
 def fallback_youtube_extractor(video_id):
-    """Direct HTTP fallback if youtube-transcript-api fails."""
+    """Uses Jina AI to bypass Streamlit Cloud IP bans for YouTube transcripts."""
     try:
-        url = f"https://www.youtube.com/watch?v={video_id}"
-        html = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}).text
-        match = re.search(r'"captionTracks":\[\{"baseUrl":"([^"]+)"', html)
-        if match:
-            caption_url = match.group(1).replace("\\u0026", "&")
-            xml_data = requests.get(caption_url).text
-            root = ET.fromstring(xml_data)
-            return " ".join([child.text for child in root if child.text])
-        return None
+        jina_url = f"https://r.jina.ai/https://www.youtube.com/watch?v={video_id}"
+        resp = requests.get(jina_url, timeout=15)
+        resp.raise_for_status()
+        return clean_web_markdown(resp.text)
     except Exception:
         return None
 
@@ -318,7 +314,7 @@ def section_generator(api_key):
         elif source_type == "YouTube URL":
             url = st.text_input("Video URL")
             if url:
-                with st.spinner("Transcribing..."):
+                with st.spinner("Transcribing via Jina AI & Subtitles..."):
                     try:
                         match = re.search(r'(?:v=|youtu\.be\/|shorts\/|embed\/)([0-9A-Za-z_-]{11})', url)
                         if not match:
@@ -328,10 +324,14 @@ def section_generator(api_key):
                         raw_text = None
                         if YOUTUBE_AVAILABLE:
                             try:
-                                raw_transcript = YouTubeTranscriptApi.get_transcript(video_id)
+                                # Try to get English explicitly first, else fallback to default
+                                try:
+                                    raw_transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=['en', 'en-US', 'en-GB'])
+                                except:
+                                    raw_transcript = YouTubeTranscriptApi.get_transcript(video_id)
                                 raw_text = " ".join([t['text'] for t in raw_transcript])
                             except Exception:
-                                pass
+                                pass # Blocked by Streamlit Cloud IP - falling through to Jina AI
                                 
                         if not raw_text:
                             raw_text = fallback_youtube_extractor(video_id)
@@ -341,7 +341,7 @@ def section_generator(api_key):
                             with st.expander("Preview & Edit Transcript", expanded=True):
                                 content_text = st.text_area("Edit text before generating:", raw_text, height=200)
                         else:
-                            st.error("Failed to extract transcript. The video might not have captions enabled.")
+                            st.error("Failed to extract transcript. The video might not have captions enabled, or it is age-restricted.")
                             
                     except Exception as e: 
                         st.error(f"Error: {e}")
