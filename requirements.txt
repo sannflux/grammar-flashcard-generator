@@ -4,7 +4,7 @@ altair
 google-genai
 pydantic
 beautifulsoup4
-youtube-transcript-api>=0.6.2
+youtube-transcript-api
 pypdf
 Pillow
 gTTS
