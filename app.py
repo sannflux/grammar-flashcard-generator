@@ -25,7 +25,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 # ====================== 1. SAFE IMPORTS & CONFIGURATION ======================
 st.set_page_config(
-    page_title="Flashcard Library Pro v6.1", 
+    page_title="Flashcard Library Pro v6.2", 
     page_icon="🧠", 
     layout="wide",
     initial_sidebar_state="expanded"
@@ -170,32 +170,30 @@ def extract_youtube_id(url):
     return match.group(1) if match else None
 
 def get_native_youtube_transcript(video_id):
-    """Zero-dependency extractor: safely parses the ytInitialPlayerResponse JSON payload."""
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
-    resp = requests.get(f"https://www.youtube.com/watch?v={video_id}", headers=headers)
+    """Zero-dependency extractor with Bot-Bypass Cookies."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    # This cookie tells YouTube we already consented, bypassing the bot wall
+    cookies = {"CONSENT": "YES+cb.20210328-17-p0.en+FX+478"} 
     
-    # Extract the JSON object embedded in the page
-    match = re.search(r'ytInitialPlayerResponse\s*=\s*(\{.+?\});', resp.text)
-    if not match:
-        raise ValueError("Could not locate YouTube player data in the page source.")
+    html_content = requests.get(f"https://www.youtube.com/watch?v={video_id}", headers=headers, cookies=cookies).text
+    
+    # Locate the hidden JSON array containing the caption tracks
+    captions_match = re.search(r'"captionTracks":(\[.*?\])', html_content)
+    if not captions_match:
+        raise ValueError("No closed captions exist for this video, or it is age-restricted.")
         
     try:
-        player_data = json.loads(match.group(1))
-    except json.JSONDecodeError:
-        raise ValueError("Failed to parse YouTube player data.")
+        captions_json = json.loads(captions_match.group(1))
+        # Default to the first available transcript
+        transcript_url = captions_json[0]['baseUrl']
+    except (json.JSONDecodeError, IndexError, KeyError):
+        raise ValueError("Failed to parse YouTube caption data.")
         
-    # Traverse the JSON tree safely
-    captions = player_data.get('captions', {})
-    track_list = captions.get('playerCaptionsTracklistRenderer', {}).get('captionTracks', [])
-    
-    if not track_list:
-        raise ValueError("No closed captions exist for this video.")
-        
-    # Grab the first available track URL
-    xml_url = track_list[0]['baseUrl']
-    
-    # Fetch and parse the XML
-    xml_resp = requests.get(xml_url, headers=headers)
+    # Fetch the raw XML and clean it
+    xml_resp = requests.get(transcript_url, headers=headers)
     clean_text = re.sub(r'<[^>]+>', ' ', xml_resp.text)
     clean_text = html.unescape(clean_text)
     return re.sub(r'\s+', ' ', clean_text).strip()
@@ -309,9 +307,9 @@ def section_generator(api_key):
                             try:
                                 raw_text = " ".join([t['text'] for t in YouTubeTranscriptApi.get_transcript(video_id)])
                             except Exception:
-                                pass # Library failed (corrupted environment), move to Plan B
+                                pass # Move to Plan B
                         
-                        # Attempt Plan B: Native JSON Parsing Extractor
+                        # Attempt Plan B: Native JSON Parsing Extractor with Bot Bypass
                         if not raw_text:
                             raw_text = get_native_youtube_transcript(video_id)
                         
