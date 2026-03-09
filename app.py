@@ -24,7 +24,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 # ====================== 1. SAFE IMPORTS & CONFIGURATION ======================
 st.set_page_config(
-    page_title="Flashcard Library Pro v6.3", 
+    page_title="Flashcard Library Pro v6.4", 
     page_icon="🧠", 
     layout="wide",
     initial_sidebar_state="expanded"
@@ -155,9 +155,18 @@ def extract_pdf_text(uploaded_file):
     try:
         pdf_bytes = io.BytesIO(uploaded_file.getvalue())
         reader = PdfReader(pdf_bytes)
-        text = "".join(page.extract_text() + "\n" for page in reader.pages)
-        return text[:25000] 
-    except Exception as e: return f"Error reading PDF: {e}"
+        text = ""
+        for page in reader.pages:
+            page_text = page.extract_text()
+            if page_text:
+                text += page_text + "\n"
+                
+        if not text.strip():
+            return "Error: This PDF appears to be an image/scan with no readable text layer."
+            
+        return text[:25000], len(reader.pages)
+    except Exception as e: 
+        return f"Error reading PDF: {e}", 0
 
 def clean_web_markdown(text):
     text = re.sub(r'<HTML.*?>.*?</HTML>', '', text, flags=re.IGNORECASE | re.DOTALL)
@@ -290,12 +299,13 @@ def section_generator(api_key):
                 pdf_file = st.file_uploader("Upload PDF Document", type=["pdf"])
                 if pdf_file:
                     with st.spinner("Extracting text from PDF..."):
-                        raw_text = extract_pdf_text(pdf_file)
+                        raw_text, page_count = extract_pdf_text(pdf_file)
                         if "Error" not in raw_text:
-                            st.success(f"PDF Extracted! ({len(raw_text)} chars)")
+                            st.success(f"Successfully read {page_count} pages! ({len(raw_text)} characters extracted)")
                             with st.expander("Preview & Edit Extracted Text", expanded=True):
-                                content_text = st.text_area("Edit text before generating:", raw_text, height=200)
-                        else: st.error(raw_text)
+                                content_text = st.text_area("Verify the text below before generating:", raw_text, height=200)
+                        else: 
+                            st.error(raw_text)
             else: st.warning("Please install 'pypdf'")
             
         elif source_type == "Image Analysis":
@@ -316,15 +326,13 @@ def section_generator(api_key):
                         video_id = match.group(1)
                         
                         raw_text = None
-                        # Method 1: Try package
                         if YOUTUBE_AVAILABLE:
                             try:
                                 raw_transcript = YouTubeTranscriptApi.get_transcript(video_id)
                                 raw_text = " ".join([t['text'] for t in raw_transcript])
                             except Exception:
-                                pass # Fall through to method 2
+                                pass
                                 
-                        # Method 2: Raw HTTP Fallback
                         if not raw_text:
                             raw_text = fallback_youtube_extractor(video_id)
                             
@@ -346,7 +354,7 @@ def section_generator(api_key):
                         raw_text = fetch_web_content(url)
                         st.success("Web Content Extracted!")
                         with st.expander("Preview & Edit Web Content", expanded=True):
-                            content_text = st.text_area("Edit text before generating (Note: AI will automatically ignore menus and comments):", raw_text, height=200)
+                            content_text = st.text_area("Edit text before generating:", raw_text, height=200)
                     except Exception as e: st.error(str(e))
 
     with col_sets:
