@@ -156,16 +156,10 @@ def extract_pdf_text(uploaded_file):
 
 def clean_web_markdown(text):
     """Aggressively removes injected HTML error blocks, markdown links, and tracking codes."""
-    # 1. Strip out ALL raw HTML tags from the markdown completely
     text = re.sub(r'<HTML.*?>.*?</HTML>', '', text, flags=re.IGNORECASE | re.DOTALL)
-    
-    # 2. Remove markdown images: ![alt](url)
     text = re.sub(r'!\[.*?\]\(.*?\)', '', text)
-    
-    # 3. Convert markdown links to just their text: [text](url) -> text
     text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)
     
-    # 4. Filter out lines that are known junk
     lines = text.split('\n')
     clean_lines = []
     for line in lines:
@@ -174,8 +168,6 @@ def clean_web_markdown(text):
         clean_lines.append(line)
         
     text = '\n'.join(clean_lines)
-    
-    # 5. Remove excessive blank lines
     text = re.sub(r'\n\s*\n', '\n\n', text)
     return text.strip()
 
@@ -188,7 +180,6 @@ def fetch_web_content(url):
         
         text = clean_web_markdown(resp.text)
         
-        # Prevent false success if it's completely blocked
         if not text or (text.count("Access Denied") > 5 and len(text) < 1000):
             raise ValueError("WAF")
             
@@ -442,15 +433,26 @@ def section_study():
 def section_library():
     st.header("📚 Library")
     with get_db_connection() as conn:
-        df_cards, decks = pd.read_sql("SELECT * FROM cards", conn), pd.read_sql("SELECT * FROM decks", conn)
+        df_cards = pd.read_sql("SELECT * FROM cards", conn)
+        decks = pd.read_sql("SELECT * FROM decks", conn)
+        
     if decks.empty: st.info("No decks."); return
 
     t1, t2, t3, t4 = st.tabs(["📊 Stats", "✏️ Edit Cards", "📤 Export", "🗑️ Manage"])
 
     with t1:
         if not df_cards.empty:
-            df_merged = pd.merge(df_cards, decks, left_on="deck_id", right_on="id")
-            st.dataframe(df_merged.groupby("name_y").agg({"repetitions": "mean", "ease_factor": "mean", "id_x": "count"}), use_container_width=True)
+            # FIX: Use explicit suffixes to prevent KeyError
+            df_merged = pd.merge(df_cards, decks, left_on="deck_id", right_on="id", suffixes=('_card', '_deck'))
+            
+            stats_df = df_merged.groupby("name").agg({
+                "repetitions": "mean", 
+                "ease_factor": "mean", 
+                "id_card": "count"
+            }).rename(columns={"id_card": "Total Cards", "repetitions": "Avg Reps", "ease_factor": "Avg Ease"})
+            
+            st.dataframe(stats_df, use_container_width=True)
+            
             if df_cards['last_reviewed'].notna().any():
                 df_cards['last_reviewed'] = pd.to_datetime(df_cards['last_reviewed']).dt.date
                 activity = df_cards['last_reviewed'].value_counts().reset_index()
