@@ -23,7 +23,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 # ====================== 1. SAFE IMPORTS & CONFIGURATION ======================
 st.set_page_config(
-    page_title="Flashcard Library Pro v5.4", 
+    page_title="Flashcard Library Pro v5.5", 
     page_icon="🧠", 
     layout="wide",
     initial_sidebar_state="expanded"
@@ -155,12 +155,27 @@ def extract_pdf_text(uploaded_file):
     except Exception as e: return f"Error reading PDF: {e}"
 
 def clean_web_markdown(text):
-    """Removes injected HTML error blocks and markdown images."""
-    # Remove raw HTML Access Denied blocks
-    text = re.sub(r'<HTML>.*?Access Denied.*?</HTML>', '', text, flags=re.IGNORECASE | re.DOTALL)
-    # Remove markdown images: ![alt](url)
+    """Aggressively removes injected HTML error blocks, markdown links, and tracking codes."""
+    # 1. Strip out ALL raw HTML tags from the markdown completely
+    text = re.sub(r'<HTML.*?>.*?</HTML>', '', text, flags=re.IGNORECASE | re.DOTALL)
+    
+    # 2. Remove markdown images: ![alt](url)
     text = re.sub(r'!\[.*?\]\(.*?\)', '', text)
-    # Remove empty lines left behind
+    
+    # 3. Convert markdown links to just their text: [text](url) -> text
+    text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)
+    
+    # 4. Filter out lines that are known junk
+    lines = text.split('\n')
+    clean_lines = []
+    for line in lines:
+        if "Access Denied" in line or "edgesuite.net" in line or "Reference #" in line:
+            continue
+        clean_lines.append(line)
+        
+    text = '\n'.join(clean_lines)
+    
+    # 5. Remove excessive blank lines
     text = re.sub(r'\n\s*\n', '\n\n', text)
     return text.strip()
 
@@ -173,8 +188,8 @@ def fetch_web_content(url):
         
         text = clean_web_markdown(resp.text)
         
-        # If after cleaning, it's totally empty or still just an access denied message
-        if not text or ("Access Denied" in text and "permission to access" in text):
+        # Prevent false success if it's completely blocked
+        if not text or (text.count("Access Denied") > 5 and len(text) < 1000):
             raise ValueError("WAF")
             
         return text[:25000]
@@ -188,16 +203,20 @@ def fetch_web_content(url):
         soup = BeautifulSoup(resp.content, 'html.parser')
         for s in soup(["script", "style", "nav", "footer", "header"]): s.decompose()
         text = " ".join(soup.stripped_strings)
-        
-        if "Access Denied" in text and "permission to access" in text:
-            raise Exception("Site is heavily protected by enterprise firewalls (Akamai). Please copy the text manually and use 'Text/Paste'.")
-            
         return text[:25000]
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
 def generate_flashcards(api_key, text_content, image_content, difficulty, count_val):
     client = genai.Client(api_key=api_key)
-    system_prompt = f"Act as a professor for {difficulty} level students. Create {count_val} flashcards strictly based on the user input. RULES: Output JSON only. 'back' field MUST use <b>bold</b> tags for keywords."
+    system_prompt = f"""
+    Act as a professor for {difficulty} level students. 
+    Create {count_val} flashcards strictly based on the core educational content provided.
+    
+    CRITICAL INSTRUCTIONS:
+    - IGNORE website navigation menus, sidebars, 'Log in' prompts, and comment sections.
+    - Focus ONLY on the actual definitions, rules, or educational topics.
+    - Output JSON only. 'back' field MUST use <b>bold</b> tags for keywords.
+    """
     
     contents = []
     if text_content: contents.append(text_content)
@@ -293,7 +312,7 @@ def section_generator(api_key):
                         raw_text = fetch_web_content(url)
                         st.success("Web Content Extracted!")
                         with st.expander("Preview & Edit Web Content", expanded=True):
-                            content_text = st.text_area("Edit text before generating:", raw_text, height=200)
+                            content_text = st.text_area("Edit text before generating (Note: AI will automatically ignore menus and comments):", raw_text, height=200)
                     except Exception as e: st.error(str(e))
 
     with col_sets:
