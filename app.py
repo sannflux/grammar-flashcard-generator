@@ -150,9 +150,10 @@ def extract_pdf_text(uploaded_file):
     try:
         pdf_bytes = io.BytesIO(uploaded_file.getvalue())
         reader = PdfReader(pdf_bytes)
-        text = "".join(page.extract_text() + "\n" for page in reader.pages)
-        return text[:25000] 
-    except Exception as e: return f"Error reading PDF: {e}"
+        text = "".join((page.extract_text() or "") + "\n" for page in reader.pages)
+        return text[:25000], None 
+    except Exception as e: 
+        return None, f"Error reading PDF: {e}"
 
 def clean_web_markdown(text):
     """Aggressively removes injected HTML error blocks, markdown links, and tracking codes."""
@@ -266,12 +267,12 @@ def section_generator(api_key):
                 pdf_file = st.file_uploader("Upload PDF Document", type=["pdf"])
                 if pdf_file:
                     with st.spinner("Extracting text from PDF..."):
-                        raw_text = extract_pdf_text(pdf_file)
-                        if "Error" not in raw_text:
+                        raw_text, err = extract_pdf_text(pdf_file)
+                        if not err:
                             st.success(f"PDF Extracted! ({len(raw_text)} chars)")
                             with st.expander("Preview & Edit Extracted Text", expanded=True):
                                 content_text = st.text_area("Edit text before generating:", raw_text, height=200)
-                        else: st.error(raw_text)
+                        else: st.error(err)
             else: st.warning("Please install 'pypdf'")
             
         elif source_type == "Image Analysis":
@@ -387,116 +388,4 @@ def section_study():
             else:
                 cards = conn.execute("SELECT * FROM cards WHERE deck_id = ? AND next_review <= ? ORDER BY next_review ASC LIMIT 50", (deck_id, datetime.now().strftime("%Y-%m-%d"))).fetchall()
             
-            st.session_state["study_queue"] = [dict(c) for c in cards]
-            st.session_state["study_index"], st.session_state["show_answer"] = 0, False
-            st.session_state["session_stats"] = {"reviewed": 0, "correct": 0, "start_time": time.time()}
-
-    queue, idx = st.session_state["study_queue"], st.session_state["study_index"]
-    if not queue: st.success("All caught up!"); return
-
-    if idx < len(queue):
-        card = queue[idx]
-        st.progress((idx + 1) / len(queue), text=f"Card {idx+1}/{len(queue)}")
-        
-        audio_html, back_content, explanation_html = "", "<span style='opacity:0.6;'>(Think...)</span>", ""
-        if st.session_state["show_answer"]:
-            back_content = card['back']
-            audio_html = text_to_speech_html(card['front'] + " ... " + card['back'])
-            if card.get("explanation"): explanation_html = f'<div class="card-explanation">💡 {card["explanation"]}</div>'
-
-        st.markdown(f"""
-        <div class="flashcard">
-            <div class="card-tag">{card['tag']}</div>
-            <div class="card-front">{card['front']}</div>
-            <div class="card-back">{back_content}</div>
-            {explanation_html}{audio_html}
-        </div>""", unsafe_allow_html=True)
-        st.write("") 
-        
-        if not st.session_state["show_answer"]: st.button("👁️ Show Answer", type="primary", use_container_width=True, on_click=cb_show_answer)
-        else:
-            cols, labels, scores = st.columns(4), ["Again", "Hard", "Good", "Easy"], [0, 3, 4, 5]
-            for i, col in enumerate(cols): col.button(labels[i], use_container_width=True, on_click=cb_submit_review, args=(scores[i], card['id']))
-    else:
-        st.balloons()
-        st.subheader("🏁 Complete!")
-        stats = st.session_state["session_stats"]
-        acc = int((stats["correct"]/stats["reviewed"]*100)) if stats["reviewed"] else 0
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Cards", stats['reviewed'])
-        c2.metric("Accuracy", f"{acc}%")
-        c3.metric("Time", f"{round((time.time() - stats['start_time']) / 60, 1) if stats['start_time'] else 0} min")
-        if st.button("Start Over"):
-            st.session_state["current_deck_id"] = None
-            st.rerun()
-
-def section_library():
-    st.header("📚 Library")
-    with get_db_connection() as conn:
-        df_cards = pd.read_sql("SELECT * FROM cards", conn)
-        decks = pd.read_sql("SELECT * FROM decks", conn)
-        
-    if decks.empty: st.info("No decks."); return
-
-    t1, t2, t3, t4 = st.tabs(["📊 Stats", "✏️ Edit Cards", "📤 Export", "🗑️ Manage"])
-
-    with t1:
-        if not df_cards.empty:
-            # FIX: Use explicit suffixes to prevent KeyError
-            df_merged = pd.merge(df_cards, decks, left_on="deck_id", right_on="id", suffixes=('_card', '_deck'))
-            
-            stats_df = df_merged.groupby("name").agg({
-                "repetitions": "mean", 
-                "ease_factor": "mean", 
-                "id_card": "count"
-            }).rename(columns={"id_card": "Total Cards", "repetitions": "Avg Reps", "ease_factor": "Avg Ease"})
-            
-            st.dataframe(stats_df, use_container_width=True)
-            
-            if df_cards['last_reviewed'].notna().any():
-                df_cards['last_reviewed'] = pd.to_datetime(df_cards['last_reviewed']).dt.date
-                activity = df_cards['last_reviewed'].value_counts().reset_index()
-                activity.columns = ['date', 'count']
-                st.altair_chart(alt.Chart(activity).mark_rect().encode(x='date:O', y='count:Q', color='count'), use_container_width=True)
-
-    with t2:
-        if not df_cards.empty:
-            edited = st.data_editor(df_cards[['id', 'front', 'back', 'explanation', 'tag']], hide_index=True, use_container_width=True, disabled=["id"])
-            if st.button("💾 Save to DB", type="primary"):
-                with get_db_connection() as conn:
-                    for _, r in edited.iterrows(): conn.execute("UPDATE cards SET front=?, back=?, explanation=?, tag=? WHERE id=?", (r['front'], r['back'], r['explanation'], r['tag'], r['id']))
-                    conn.commit()
-                st.success("Updated!")
-
-    with t3:
-        export_deck = st.selectbox("Export Deck", decks['name'].tolist())
-        deck_id_raw = decks[decks['name'] == export_deck].iloc[0]['id']
-        with get_db_connection() as conn: cards_df = pd.read_sql("SELECT front, back, tag FROM cards WHERE deck_id=?", conn, params=(int(deck_id_raw),))
-        st.download_button("Download CSV", data=cards_df.to_csv(index=False, header=False).encode('utf-8') if not cards_df.empty else b"", file_name=f"{export_deck}.csv", disabled=cards_df.empty)
-
-    with t4:
-        c1, c2 = st.columns(2)
-        with c1:
-            ren = st.selectbox("Rename", decks['name'].tolist(), key="r_sel")
-            new_n = st.text_input("New Name")
-            if st.button("Rename") and new_n:
-                if rename_deck(ren, new_n): st.success("Done!"); time.sleep(1); st.rerun()
-                else: st.error("Name exists.")
-        with c2:
-            d_del = st.selectbox("Delete", decks['name'].tolist(), key="d_sel")
-            if st.button(f"🗑️ Delete {d_del}"): delete_deck(d_del); st.rerun()
-
-def main():
-    inject_custom_css()
-    with st.sidebar:
-        st.title("🧠 Flashcard Pro")
-        api_key = st.text_input("Gemini API Key", type="password")
-        st.metric("Cards Due Today", get_due_cards_count())
-        st.divider()
-        page = st.radio("Navigation", ["Study Mode", "Generator", "Library & Stats"], label_visibility="collapsed")
-    
-    if page == "Generator": section_generator(api_key)
-    elif page == "Study Mode": section_study()
-    elif page == "Library & Stats": section_library()
-
-if __name__ == "__main__": main()
+            st.session_state["study
