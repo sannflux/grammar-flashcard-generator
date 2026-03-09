@@ -1,10 +1,11 @@
-streamlit
+streamlit>=1.30.0
 pandas
+altair
 google-genai
 pydantic
-youtube-transcript-api
 beautifulsoup4
-requests
-altair
-Pillow
+youtube-transcript-api
 pypdf
+Pillow
+gTTS
+tenacity
