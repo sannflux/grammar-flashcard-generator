@@ -23,7 +23,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 # ====================== 1. SAFE IMPORTS & CONFIGURATION ======================
 st.set_page_config(
-    page_title="Flashcard Library Pro v6.1", 
+    page_title="Flashcard Library Pro v6.2", 
     page_icon="🧠", 
     layout="wide",
     initial_sidebar_state="expanded"
@@ -235,7 +235,7 @@ def generate_flashcards(api_key, text_content, image_content, difficulty, count_
 def text_to_speech_html(text):
     try:
         clean_text = re.sub(r'<[^>]+>', '', text)
-        clean_text = re.sub(r'\{\{c1::(.*?)\}\}', r'\1', clean_text) # Fix for Cloze reading
+        clean_text = re.sub(r'\{\{c1::(.*?)\}\}', r'\1', clean_text) 
         tts = gTTS(text=clean_text, lang='en')
         fp = io.BytesIO()
         tts.write_to_fp(fp)
@@ -297,16 +297,27 @@ def section_generator(api_key):
                 if url:
                     with st.spinner("Transcribing..."):
                         try:
-                            # ROBUST YOUTUBE URL REGEX FIX
+                            # 1. Regex to robustly grab the 11-char video ID from any format
                             match = re.search(r'(?:v=|youtu\.be\/|shorts\/|embed\/)([0-9A-Za-z_-]{11})', url)
                             if not match:
                                 raise ValueError("Could not extract a valid 11-character YouTube Video ID from the URL.")
                             video_id = match.group(1)
                             
-                            raw_text = " ".join([t['text'] for t in YouTubeTranscriptApi.get_transcript(video_id)])
+                            # 2. Try official method, fallback to older/unofficial methods
+                            raw_transcript = None
+                            try:
+                                raw_transcript = YouTubeTranscriptApi.get_transcript(video_id)
+                            except AttributeError:
+                                try:
+                                    raw_transcript = YouTubeTranscriptApi.getTranscript(video_id)
+                                except Exception:
+                                    raise ValueError("Your 'youtube-transcript-api' package is incorrect/outdated. Run: pip install --upgrade youtube-transcript-api")
+                            
+                            raw_text = " ".join([t['text'] for t in raw_transcript])
                             st.success("Transcript Extracted!")
                             with st.expander("Preview & Edit Transcript", expanded=True):
                                 content_text = st.text_area("Edit text before generating:", raw_text, height=200)
+                                
                         except Exception as e: 
                             st.error(f"Error: {e}")
             else: st.warning("Install youtube-transcript-api")
@@ -429,9 +440,8 @@ def section_study():
             else:
                 front_content = re.sub(r'\{\{c1::(.*?)\}\}', r'<span class="cloze-reveal">\1</span>', front_content)
                 back_content = f"<i>Extra Info: {card['back']}</i>" if card['back'] else ""
-                audio_html = text_to_speech_html(card['front']) # Reads full sentence
+                audio_html = text_to_speech_html(card['front']) 
         else:
-            # Basic Card
             if st.session_state["show_answer"]:
                 back_content = card['back']
                 audio_html = text_to_speech_html(card['front'] + " ... " + card['back'])
