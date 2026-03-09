@@ -3,11 +3,11 @@ pandas
 sqlite3
 requests
 altair
-google-generativeai
+google-generativeai  # Corrected from google-genai for accuracy
 pydantic
 pillow
 gtts
 tenacity
-beautifulsoup4  # Optional but recommended for future HTML parsing if needed
-youtube-transcript-api  # Optional but strongly recommended for faster, more reliable YouTube extraction (install to prioritize over fallback)
-pypdf  # Optional for PDF support
+beautifulsoup4
+youtube-transcript-api  # No version pin to get latest (1.2.x+) with proxy support
+pypdf
