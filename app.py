@@ -25,7 +25,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 # ====================== 1. SAFE IMPORTS & CONFIGURATION ======================
 st.set_page_config(
-    page_title="Flashcard Library Pro v6.0", 
+    page_title="Flashcard Library Pro v6.1", 
     page_icon="🧠", 
     layout="wide",
     initial_sidebar_state="expanded"
@@ -170,19 +170,32 @@ def extract_youtube_id(url):
     return match.group(1) if match else None
 
 def get_native_youtube_transcript(video_id):
-    """Zero-dependency extractor: fetches the raw XML subtitle track from YouTube's backend."""
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    """Zero-dependency extractor: safely parses the ytInitialPlayerResponse JSON payload."""
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
     resp = requests.get(f"https://www.youtube.com/watch?v={video_id}", headers=headers)
     
-    # Locate the hidden caption track URL inside the YouTube page source
-    match = re.search(r'"captionTracks":\[\{"baseUrl":"([^"]+)"', resp.text)
+    # Extract the JSON object embedded in the page
+    match = re.search(r'ytInitialPlayerResponse\s*=\s*(\{.+?\});', resp.text)
     if not match:
+        raise ValueError("Could not locate YouTube player data in the page source.")
+        
+    try:
+        player_data = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        raise ValueError("Failed to parse YouTube player data.")
+        
+    # Traverse the JSON tree safely
+    captions = player_data.get('captions', {})
+    track_list = captions.get('playerCaptionsTracklistRenderer', {}).get('captionTracks', [])
+    
+    if not track_list:
         raise ValueError("No closed captions exist for this video.")
         
-    xml_url = match.group(1).replace('\\u0026', '&')
-    xml_resp = requests.get(xml_url, headers=headers)
+    # Grab the first available track URL
+    xml_url = track_list[0]['baseUrl']
     
-    # Strip the XML timestamps (<text start="1.0">Hello</text> -> Hello)
+    # Fetch and parse the XML
+    xml_resp = requests.get(xml_url, headers=headers)
     clean_text = re.sub(r'<[^>]+>', ' ', xml_resp.text)
     clean_text = html.unescape(clean_text)
     return re.sub(r'\s+', ' ', clean_text).strip()
@@ -298,7 +311,7 @@ def section_generator(api_key):
                             except Exception:
                                 pass # Library failed (corrupted environment), move to Plan B
                         
-                        # Attempt Plan B: Native XML Extractor (Zero Dependencies)
+                        # Attempt Plan B: Native JSON Parsing Extractor
                         if not raw_text:
                             raw_text = get_native_youtube_transcript(video_id)
                         
