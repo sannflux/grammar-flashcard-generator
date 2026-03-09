@@ -25,7 +25,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 # ====================== 1. SAFE IMPORTS & CONFIGURATION ======================
 st.set_page_config(
-    page_title="Flashcard Library Pro v6.3", 
+    page_title="Flashcard Library Pro v6.4", 
     page_icon="🧠", 
     layout="wide",
     initial_sidebar_state="expanded"
@@ -169,40 +169,39 @@ def extract_youtube_id(url):
     match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11}).*', url)
     return match.group(1) if match else None
 
-def get_native_youtube_transcript(video_id):
-    """Multi-stage YouTube Extractor."""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-    cookies = {"CONSENT": "YES+cb.20210328-17-p0.en+FX+478"} 
+def get_ghost_proxy_transcript(video_id):
+    """Bypasses IP Blocks entirely by routing through AllOrigins Ghost Proxy."""
+    target_url = f"https://www.youtube.com/watch?v={video_id}"
+    proxy_url = f"https://api.allorigins.win/get?url={urllib.parse.quote(target_url)}"
     
-    # --- STAGE 1: NATIVE HTML PARSE (Forgiving Regex) ---
-    try:
-        html_content = requests.get(f"https://www.youtube.com/watch?v={video_id}", headers=headers, cookies=cookies, timeout=10).text
-        # Forgiving regex looking for "captionTracks" with optional spaces
-        captions_match = re.search(r'"captionTracks"\s*:\s*(\[.*?\])', html_content)
-        if captions_match:
-            captions_json = json.loads(captions_match.group(1))
-            xml_url = captions_json[0]['baseUrl']
-            xml_resp = requests.get(xml_url, headers=headers, timeout=10)
-            clean_text = re.sub(r'<[^>]+>', ' ', xml_resp.text)
-            clean_text = html.unescape(clean_text)
-            return re.sub(r'\s+', ' ', clean_text).strip()
-    except Exception:
-        pass # Fallback to Stage 2
+    # Fetch the YouTube page via Proxy
+    resp = requests.get(proxy_url, timeout=15)
+    resp_data = resp.json()
+    html_content = resp_data.get("contents", "")
+    
+    if not html_content:
+        raise ValueError("Proxy failed to fetch YouTube page data.")
         
-    # --- STAGE 2: PROXY API FALLBACK ---
-    try:
-        proxy_resp = requests.get(f"https://youtubetranscript.com/?server_vid2={video_id}", timeout=10)
-        if '<transcript>' in proxy_resp.text or '<?xml' in proxy_resp.text:
-            clean_text = re.sub(r'<[^>]+>', ' ', proxy_resp.text)
-            clean_text = html.unescape(clean_text)
-            return re.sub(r'\s+', ' ', clean_text).strip()
-    except Exception:
-        pass
+    # Natively parse the JSON from the proxy's HTML
+    captions_match = re.search(r'"captionTracks"\s*:\s*(\[.*?\])', html_content)
+    if not captions_match:
+        raise ValueError("No closed captions or auto-captions found for this video.")
         
-    raise ValueError("All extraction methods failed. The video may not have closed captions.")
+    try:
+        captions_json = json.loads(captions_match.group(1))
+        xml_url = captions_json[0]['baseUrl']
+    except (json.JSONDecodeError, IndexError, KeyError):
+        raise ValueError("Failed to parse caption structure.")
+        
+    # Route the XML download through the Proxy as well (since YouTube blocks IP downloads too)
+    xml_proxy_url = f"https://api.allorigins.win/get?url={urllib.parse.quote(xml_url)}"
+    xml_resp = requests.get(xml_proxy_url, timeout=15)
+    xml_content = xml_resp.json().get("contents", "")
+    
+    # Strip formatting
+    clean_text = re.sub(r'<[^>]+>', ' ', xml_content)
+    clean_text = html.unescape(clean_text)
+    return re.sub(r'\s+', ' ', clean_text).strip()
 
 def clean_web_markdown(text):
     text = re.sub(r'<HTML.*?>.*?</HTML>', '', text, flags=re.IGNORECASE | re.DOTALL)
@@ -308,23 +307,23 @@ def section_generator(api_key):
                             raise ValueError("Invalid YouTube URL.")
                         
                         raw_text = ""
-                        # Plan A: Library
+                        # Stage 1: Try Local (if environment allows)
                         if YOUTUBE_AVAILABLE:
                             try:
                                 raw_text = " ".join([t['text'] for t in YouTubeTranscriptApi.get_transcript(video_id)])
                             except Exception:
-                                pass
+                                pass 
                         
-                        # Plan B & C: Custom Extractor
+                        # Stage 2: Ghost Proxy Extractor (Bypasses IP Bans)
                         if not raw_text:
-                            raw_text = get_native_youtube_transcript(video_id)
+                            raw_text = get_ghost_proxy_transcript(video_id)
                         
                         st.success("Transcript Extracted Successfully!")
                         with st.expander("Preview & Edit Transcript", expanded=True):
                             content_text = st.text_area("Edit text before generating:", raw_text, height=200)
                             
                     except Exception as e: 
-                        st.error(f"Error extracting transcript: {str(e)}")
+                        st.error(f"Extraction Failed: {str(e)}")
 
         elif source_type == "Web Article":
             url = st.text_input("Article URL")
