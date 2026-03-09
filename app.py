@@ -169,34 +169,57 @@ def extract_youtube_id(url):
     match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11}).*', url)
     return match.group(1) if match else None
 
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=10))
 def get_ghost_proxy_transcript(video_id):
-    """Bypasses IP Blocks entirely by routing through AllOrigins Ghost Proxy."""
     target_url = f"https://www.youtube.com/watch?v={video_id}"
     proxy_url = f"https://api.allorigins.win/get?url={urllib.parse.quote(target_url)}"
     
-    # Fetch the YouTube page via Proxy
     resp = requests.get(proxy_url, timeout=15)
+    resp.raise_for_status()
     resp_data = resp.json()
     html_content = resp_data.get("contents", "")
     
     if not html_content:
         raise ValueError("Proxy failed to fetch YouTube page data.")
-        
-    # Natively parse the JSON from the proxy's HTML
-    captions_match = re.search(r'"captionTracks"\s*:\s*(\[.*?\])', html_content)
-    if not captions_match:
-        raise ValueError("No closed captions or auto-captions found for this video.")
-        
+    
+    # Extract ytInitialPlayerResponse JSON
+    pattern = r'ytInitialPlayerResponse\s*=\s*({.*?});\s*(?:var\s+meta|</script|\n)'
+    match = re.search(pattern, html_content, re.DOTALL)
+    if not match:
+        raise ValueError("No player response found in the page.")
+    
     try:
-        captions_json = json.loads(captions_match.group(1))
-        xml_url = captions_json[0]['baseUrl']
-    except (json.JSONDecodeError, IndexError, KeyError):
+        data = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        raise ValueError("Failed to parse player response JSON.")
+    
+    if 'captions' not in data:
+        raise ValueError("No captions or auto-captions found for this video.")
+    
+    try:
+        caption_tracks = data['captions']['playerCaptionsTracklistRenderer']['captionTracks']
+    except KeyError:
         raise ValueError("Failed to parse caption structure.")
-        
-    # Route the XML download through the Proxy as well (since YouTube blocks IP downloads too)
+    
+    # Find English track, prefer manual (no 'kind'=='asr') over auto-generated
+    english_track = next(
+        (track for track in caption_tracks if track['languageCode'].startswith('en') and 'kind' not in track),
+        next((track for track in caption_tracks if track['languageCode'].startswith('en')), None)
+    )
+    if not english_track:
+        raise ValueError("No English captions found.")
+    
+    # Append fmt=ttml for XML format
+    xml_url = english_track['baseUrl'] + '&fmt=ttml'
+    
+    # Fetch XML via proxy
     xml_proxy_url = f"https://api.allorigins.win/get?url={urllib.parse.quote(xml_url)}"
     xml_resp = requests.get(xml_proxy_url, timeout=15)
+    xml_resp.raise_for_status()
     xml_content = xml_resp.json().get("contents", "")
+    
+    if not xml_content:
+        raise ValueError("Failed to fetch caption XML.")
     
     # Strip formatting
     clean_text = re.sub(r'<[^>]+>', ' ', xml_content)
