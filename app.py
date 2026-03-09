@@ -38,8 +38,12 @@ except ImportError:
     BS4_AVAILABLE = False
 
 try:
-    from youtube_transcript_api import YouTubeTranscriptApi
+    from youtube_transcript_api import YouTubeTranscriptApi, WebshareProxyConfig, GenericProxyConfig
+    import youtube_transcript_api
     YOUTUBE_AVAILABLE = True
+    # Version check for proxy support (requires >=1.1.0)
+    if tuple(map(int, youtube_transcript_api.__version__.split('.'))) < (1, 1, 0):
+        st.warning("youtube-transcript-api version is outdated (<1.1.0). Upgrade to latest for proxy support and better IP ban handling.")
 except ImportError:
     YOUTUBE_AVAILABLE = False
 
@@ -322,6 +326,16 @@ def section_generator(api_key):
 
         elif source_type == "YouTube URL":
             url = st.text_input("Video URL")
+            with st.expander("Proxy Config (to bypass IP bans)"):
+                proxy_type = st.selectbox("Proxy Type", ["None", "Webshare", "Generic"])
+                if proxy_type == "Webshare":
+                    proxy_username = st.text_input("Webshare Username")
+                    proxy_password = st.text_input("Webshare Password", type="password")
+                    proxy_locations = st.text_input("Locations (e.g., us,de)", "")
+                elif proxy_type == "Generic":
+                    http_proxy = st.text_input("HTTP Proxy (e.g., http://user:pass@host:port)")
+                    https_proxy = st.text_input("HTTPS Proxy (e.g., https://user:pass@host:port)")
+            
             if url:
                 with st.spinner("Transcribing..."):
                     try:
@@ -330,12 +344,27 @@ def section_generator(api_key):
                             raise ValueError("Invalid YouTube URL.")
                         
                         raw_text = ""
-                        # Stage 1: Try Local (if environment allows)
+                        proxy_config = None
                         if YOUTUBE_AVAILABLE:
+                            if proxy_type == "Webshare" and proxy_username and proxy_password:
+                                proxy_config = WebshareProxyConfig(
+                                    proxy_username=proxy_username,
+                                    proxy_password=proxy_password,
+                                    filter_ip_locations=proxy_locations.split(",") if proxy_locations else None
+                                )
+                            elif proxy_type == "Generic" and http_proxy:
+                                proxy_config = GenericProxyConfig(
+                                    http_url=http_proxy,
+                                    https_url=https_proxy or http_proxy
+                                )
+                            
+                            ytt_api = YouTubeTranscriptApi(proxy_config=proxy_config)
                             try:
-                                raw_text = " ".join([t['text'] for t in YouTubeTranscriptApi.get_transcript(video_id)])
-                            except Exception:
-                                pass 
+                                transcript_list = ytt_api.list_transcripts(video_id)
+                                transcript = transcript_list.find_generated_transcript(['en']) or transcript_list.find_manually_created_transcript(['en'])
+                                raw_text = " ".join([t['text'] for t in transcript.fetch()])
+                            except Exception as lib_e:
+                                st.warning(f"Library failed: {lib_e}. Falling back to proxy method.")
                         
                         # Stage 2: Ghost Proxy Extractor (Bypasses IP Bans)
                         if not raw_text:
@@ -346,7 +375,7 @@ def section_generator(api_key):
                             content_text = st.text_area("Edit text before generating:", raw_text, height=200)
                             
                     except Exception as e: 
-                        st.error(f"Extraction Failed: {str(e)}")
+                        st.error(f"Extraction Failed: {str(e)}. Try configuring a proxy (e.g., Webshare residential) to bypass IP blocks.")
 
         elif source_type == "Web Article":
             url = st.text_input("Article URL")
