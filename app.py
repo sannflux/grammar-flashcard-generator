@@ -9,7 +9,6 @@ import json
 import time
 import io
 import base64
-import os
 import html
 from datetime import datetime, timedelta
 import altair as alt
@@ -56,6 +55,9 @@ DEFAULT_STATE = {
     "show_answer": False,
     "session_stats": {"reviewed": 0, "correct": 0, "start_time": None},
     "cram_mode": False,
+    # YouTube Assist Mode state
+    "yt_assist_text": "",
+    "yt_last_error": "",
 }
 
 for key, value in DEFAULT_STATE.items():
@@ -202,7 +204,6 @@ def _parse_transcript_json3(json_text: str) -> str:
     return _normalize_transcript_text(chunks)
 
 def _parse_transcript_vtt(vtt_text: str) -> str:
-    # Remove WEBVTT header, timestamps, and cues formatting
     lines = vtt_text.splitlines()
     out = []
     for ln in lines:
@@ -215,7 +216,21 @@ def _parse_transcript_vtt(vtt_text: str) -> str:
             continue
         if re.match(r'^\d{2}:\d{2}\.\d{3}\s+-->\s+\d{2}:\d{2}\.\d{3}', s):
             continue
-        # Strip basic tags
+        s = re.sub(r'<[^>]+>', '', s)
+        out.append(s)
+    return _normalize_transcript_text(out)
+
+def _parse_transcript_srt(srt_text: str) -> str:
+    lines = srt_text.splitlines()
+    out = []
+    for ln in lines:
+        s = ln.strip()
+        if not s:
+            continue
+        if re.match(r'^\d+$', s):
+            continue
+        if re.match(r'^\d{2}:\d{2}:\d{2},\d{3}\s+-->\s+\d{2}:\d{2}:\d{2},\d{3}', s):
+            continue
         s = re.sub(r'<[^>]+>', '', s)
         out.append(s)
     return _normalize_transcript_text(out)
@@ -224,20 +239,47 @@ def _parse_transcript_auto(text: str) -> str:
     if not text:
         return ""
     t = text.lstrip()
+
     if t.startswith("{") or t.startswith("["):
-        # likely json3
         parsed = _parse_transcript_json3(text)
         if parsed:
             return parsed
-    if "WEBVTT" in t[:50].upper():
+
+    if "WEBVTT" in t[:80].upper():
         parsed = _parse_transcript_vtt(text)
         if parsed:
             return parsed
+
+    if re.search(r'\d{2}:\d{2}:\d{2},\d{3}\s+-->\s+\d{2}:\d{2}:\d{2},\d{3}', text):
+        parsed = _parse_transcript_srt(text)
+        if parsed:
+            return parsed
+
     if "<text" in text and "</text>" in text:
         parsed = _parse_transcript_xml(text)
         if parsed:
             return parsed
+
+    # If it's plain text already
+    if len(text.strip()) > 20 and "<html" not in text.lower():
+        return _normalize_transcript_text([text])
+
     return ""
+
+def parse_uploaded_transcript(uploaded_file) -> Tuple[str, Optional[str]]:
+    """
+    Supports txt, vtt, srt, json (json3), xml.
+    Returns (text, error_msg).
+    """
+    try:
+        raw_bytes = uploaded_file.getvalue()
+        raw = raw_bytes.decode("utf-8", errors="ignore")
+        parsed = _parse_transcript_auto(raw)
+        if not parsed or len(parsed.strip()) < 20:
+            return "", "Could not parse transcript file (supported: .txt .vtt .srt .json .xml)."
+        return parsed[:25000], None
+    except Exception as e:
+        return "", f"Error reading transcript file: {e}"
 
 def get_youtube_transcript_via_library(video_id: str, preferred_langs: Optional[List[str]] = None) -> str:
     if not YOUTUBE_AVAILABLE:
@@ -275,98 +317,8 @@ def get_youtube_transcript_via_library(video_id: str, preferred_langs: Optional[
     data = first.fetch()
     return _normalize_transcript_text([x.get("text", "") for x in data])
 
-def _extract_ytinitialplayerresponse(html_content: str) -> Optional[dict]:
-    m = re.search(r'ytInitialPlayerResponse\s*=\s*({.*?})\s*;', html_content, flags=re.DOTALL)
-    if not m:
-        m = re.search(r'"ytInitialPlayerResponse"\s*:\s*({.*?})\s*,\s*"ytInitialData"', html_content, flags=re.DOTALL)
-    if not m:
-        return None
-    blob = m.group(1)
-    try:
-        return json.loads(blob)
-    except Exception:
-        try:
-            return json.loads(blob.replace("\n", " "))
-        except Exception:
-            return None
-
-def _discover_timedtext_tracks(video_id: str, headers: dict, cookies: dict) -> List[dict]:
-    params = {"v": video_id, "type": "list"}
-    resp = requests.get("https://www.youtube.com/api/timedtext", params=params, headers=headers, cookies=cookies, timeout=15)
-    resp.raise_for_status()
-    text = resp.text
-    if not text or "<transcript_list" not in text:
-        return []
-    tracks = []
-    for m in re.finditer(r'<track\b([^/>]*)\/?>', text, flags=re.IGNORECASE):
-        attrs = m.group(1)
-        lang_code = re.search(r'lang_code="([^"]+)"', attrs)
-        name = re.search(r'name="([^"]+)"', attrs)
-        kind = re.search(r'kind="([^"]+)"', attrs)
-        tracks.append({
-            "lang_code": lang_code.group(1) if lang_code else None,
-            "name": html.unescape(name.group(1)) if name else None,
-            "kind": kind.group(1) if kind else None,
-        })
-    return [t for t in tracks if t.get("lang_code")]
-
-def _fetch_timedtext(video_id: str, lang_code: str, headers: dict, cookies: dict, kind: Optional[str] = None, fmt: str = "json3") -> str:
-    params = {"v": video_id, "lang": lang_code, "fmt": fmt}
-    if kind:
-        params["kind"] = kind
-    resp = requests.get("https://www.youtube.com/api/timedtext", params=params, headers=headers, cookies=cookies, timeout=15)
-    resp.raise_for_status()
-    return resp.text
-
-def _get_innertube_player_json(video_id: str, headers: dict, cookies: dict) -> dict:
-    payload = {
-        "videoId": video_id,
-        "context": {
-            "client": {
-                "clientName": "WEB",
-                "clientVersion": "2.20250301.00.00",
-                "hl": "en",
-                "gl": "US",
-            }
-        }
-    }
-    url = "https://www.youtube.com/youtubei/v1/player?prettyPrint=false"
-    resp = requests.post(url, headers={**headers, "Content-Type": "application/json"}, cookies=cookies, json=payload, timeout=15)
-    resp.raise_for_status()
-    return resp.json()
-
-def _extract_caption_baseurl_from_player(player_json: dict) -> Optional[str]:
-    try:
-        tracks = (
-            player_json.get("captions", {})
-                      .get("playerCaptionsTracklistRenderer", {})
-                      .get("captionTracks", [])
-        )
-        if not tracks:
-            return None
-        for t in tracks:
-            lang = (t.get("languageCode") or "").lower()
-            if lang.startswith("en") and t.get("baseUrl"):
-                return t["baseUrl"]
-        return tracks[0].get("baseUrl")
-    except Exception:
-        return None
-
-def _fetch_and_parse_caption_url(url: str, headers: dict) -> Tuple[str, str]:
-    """
-    Fetch caption URL and parse as json3/vtt/xml. Returns (parsed_text, debug_hint).
-    """
-    resp = requests.get(url, headers=headers, timeout=15)
-    resp.raise_for_status()
-    raw = resp.text
-    parsed = _parse_transcript_auto(raw)
-    hint = raw[:200].replace("\n", "\\n")
-    return parsed, hint
-
+# NOTE: We keep the native extractor code as best-effort, but hosted infra may block it.
 def get_native_youtube_transcript(video_id: str) -> Tuple[str, List[str]]:
-    """
-    Returns: (transcript_text, stage_log)
-    """
     stage_log = []
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -374,82 +326,48 @@ def get_native_youtube_transcript(video_id: str) -> Tuple[str, List[str]]:
     }
     cookies = {"CONSENT": "YES+cb.20210328-17-p0.en+FX+478"}
 
-    # -------- Plan B: timedtext discovery + json3 fetch --------
+    # Timedtext list
     try:
-        tracks = _discover_timedtext_tracks(video_id, headers=headers, cookies=cookies)
-        stage_log.append(f"Timedtext list tracks: {len(tracks)}")
-        if tracks:
-            preferred = None
-            for t in tracks:
-                if t["lang_code"].startswith("en") and t.get("kind") is None:
-                    preferred = t
-                    break
-            if preferred is None:
+        params = {"v": video_id, "type": "list"}
+        r = requests.get("https://www.youtube.com/api/timedtext", params=params, headers=headers, cookies=cookies, timeout=15)
+        stage_log.append(f"Timedtext list status={r.status_code} len={len(r.text)}")
+        if r.ok and "<transcript_list" in r.text:
+            tracks = []
+            for m in re.finditer(r'<track\b([^/>]*)\/?>', r.text, flags=re.IGNORECASE):
+                attrs = m.group(1)
+                lang_code = re.search(r'lang_code="([^"]+)"', attrs)
+                kind = re.search(r'kind="([^"]+)"', attrs)
+                if lang_code:
+                    tracks.append({"lang_code": lang_code.group(1), "kind": kind.group(1) if kind else None})
+            stage_log.append(f"Timedtext list tracks={len(tracks)}")
+            if tracks:
+                chosen = None
                 for t in tracks:
-                    if t["lang_code"].startswith("en") and t.get("kind") == "asr":
-                        preferred = t
+                    if t["lang_code"].startswith("en") and t.get("kind") is None:
+                        chosen = t
                         break
-            if preferred is None:
-                preferred = tracks[0]
+                if chosen is None:
+                    for t in tracks:
+                        if t["lang_code"].startswith("en"):
+                            chosen = t
+                            break
+                if chosen is None:
+                    chosen = tracks[0]
 
-            raw = _fetch_timedtext(
-                video_id,
-                lang_code=preferred["lang_code"],
-                headers=headers,
-                cookies=cookies,
-                kind=preferred.get("kind"),
-                fmt="json3"
-            )
-            parsed = _parse_transcript_auto(raw)
-            stage_log.append(f"Timedtext fmt=json3 parsed_len={len(parsed)}")
-            if parsed and len(parsed) > 20:
-                return parsed, stage_log
+                params2 = {"v": video_id, "lang": chosen["lang_code"], "fmt": "json3"}
+                if chosen.get("kind"):
+                    params2["kind"] = chosen["kind"]
+                r2 = requests.get("https://www.youtube.com/api/timedtext", params=params2, headers=headers, cookies=cookies, timeout=15)
+                stage_log.append(f"Timedtext json3 status={r2.status_code} len={len(r2.text)} head='{r2.text[:80].replace(chr(10),' ')}'")
+                if r2.ok:
+                    parsed = _parse_transcript_auto(r2.text)
+                    stage_log.append(f"Timedtext parsed_len={len(parsed)}")
+                    if parsed and len(parsed) > 20:
+                        return parsed, stage_log
     except Exception as e:
         stage_log.append(f"Timedtext failed: {type(e).__name__}")
 
-    # -------- Plan B2: Innertube -> caption baseUrl --------
-    try:
-        player_json = _get_innertube_player_json(video_id, headers=headers, cookies=cookies)
-        base_url = _extract_caption_baseurl_from_player(player_json)
-        stage_log.append(f"Innertube baseUrl found: {bool(base_url)}")
-        if base_url:
-            parsed, hint = _fetch_and_parse_caption_url(base_url, headers=headers)
-            stage_log.append(f"Innertube baseUrl parsed_len={len(parsed)} hint='{hint}'")
-            if parsed and len(parsed) > 20:
-                return parsed, stage_log
-    except Exception as e:
-        stage_log.append(f"Innertube failed: {type(e).__name__}")
-
-    # -------- Plan C: watch HTML captionTracks --------
-    try:
-        watch_url = f"https://www.youtube.com/watch?v={video_id}"
-        html_content = requests.get(watch_url, headers=headers, cookies=cookies, timeout=15).text
-        player = _extract_ytinitialplayerresponse(html_content)
-        stage_log.append(f"ytInitialPlayerResponse found: {bool(player)}")
-        if not player:
-            raise ValueError("ytInitialPlayerResponse missing")
-
-        tracks = (
-            player.get("captions", {})
-                  .get("playerCaptionsTracklistRenderer", {})
-                  .get("captionTracks", [])
-        )
-        stage_log.append(f"HTML captionTracks: {len(tracks)}")
-        if not tracks:
-            raise ValueError("No captionTracks in HTML")
-
-        base_url = tracks[0].get("baseUrl")
-        if not base_url:
-            raise ValueError("Caption baseUrl missing")
-
-        parsed, hint = _fetch_and_parse_caption_url(base_url, headers=headers)
-        stage_log.append(f"HTML baseUrl parsed_len={len(parsed)} hint='{hint}'")
-        if parsed and len(parsed) > 20:
-            return parsed, stage_log
-    except Exception as e:
-        stage_log.append(f"HTML fallback failed: {type(e).__name__}")
-
-    raise ValueError("Transcript extraction returned empty text.")
+    raise ValueError("Native YouTube extraction blocked or unavailable in this environment.")
 
 def clean_web_markdown(text):
     text = re.sub(r'<HTML.*?>.*?</HTML>', '', text, flags=re.IGNORECASE | re.DOTALL)
@@ -519,6 +437,8 @@ def inject_custom_css():
         .card-back { font-size: 18px; margin-bottom: 15px; color: var(--primary-color); line-height: 1.5; }
         .card-explanation { font-size: 14px; color: var(--text-color); opacity: 0.8; font-style: italic; border-top: 1px solid var(--text-color); padding-top: 10px; width: 100%; }
         .card-tag { background: var(--primary-color); color: #ffffff; padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: 600; text-transform: uppercase; margin-bottom: 15px; }
+        .smallhelp { font-size: 13px; opacity: 0.8; }
+        .warnbox { padding: 10px 12px; border-radius: 10px; border: 1px solid rgba(255,165,0,0.4); background: rgba(255,165,0,0.08); }
     </style>
     """, unsafe_allow_html=True)
 
@@ -564,46 +484,102 @@ def section_generator(api_key):
         elif source_type == "YouTube URL":
             url = st.text_input("Video URL")
             if url:
-                with st.spinner("Transcribing..."):
-                    try:
-                        video_id = extract_youtube_id(url)
-                        if not video_id:
-                            raise ValueError("Invalid YouTube URL.")
+                video_id = extract_youtube_id(url)
+                if not video_id:
+                    st.error("Invalid YouTube URL.")
+                else:
+                    st.caption(f"Video ID: {video_id}")
 
-                        raw_text = ""
-                        stage_log = []
+                    # 1) Try automated extraction (best-effort)
+                    raw_text = ""
+                    stage_log = []
 
-                        # Plan A: youtube-transcript-api
-                        if YOUTUBE_AVAILABLE:
+                    if st.button("🔎 Try Auto-Extract Transcript", use_container_width=True):
+                        with st.spinner("Attempting auto-extraction..."):
+                            st.session_state["yt_last_error"] = ""
                             try:
-                                raw_text = get_youtube_transcript_via_library(video_id)
-                                stage_log.append("Plan A: youtube-transcript-api ✅")
-                            except (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable) as e:
-                                stage_log.append(f"Plan A: youtube-transcript-api ❌ ({type(e).__name__})")
-                                raw_text = ""
+                                # Plan A: youtube-transcript-api
+                                if YOUTUBE_AVAILABLE:
+                                    try:
+                                        raw_text = get_youtube_transcript_via_library(video_id)
+                                        stage_log.append("Plan A: youtube-transcript-api ✅")
+                                    except (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable) as e:
+                                        stage_log.append(f"Plan A: youtube-transcript-api ❌ ({type(e).__name__})")
+                                        raw_text = ""
+                                    except Exception as e:
+                                        stage_log.append(f"Plan A: youtube-transcript-api ❌ ({type(e).__name__})")
+                                        raw_text = ""
+                                else:
+                                    stage_log.append("Plan A: youtube-transcript-api (not installed)")
+
+                                # Plan B: native timedtext (often blocked on hosted infra)
+                                if not raw_text:
+                                    try:
+                                        raw_text, native_log = get_native_youtube_transcript(video_id)
+                                        stage_log.extend([f"Native: {x}" for x in native_log])
+                                    except Exception as e:
+                                        stage_log.append(f"Native: ❌ ({str(e)})")
+
+                                if not raw_text or len(raw_text.strip()) < 20:
+                                    raise ValueError("Auto-extraction failed (common on hosted Streamlit due to YouTube blocking).")
+
+                                st.session_state["yt_assist_text"] = raw_text
+                                st.success("Transcript extracted. Loaded into editor below.")
                             except Exception as e:
-                                stage_log.append(f"Plan A: youtube-transcript-api ❌ ({type(e).__name__})")
-                                raw_text = ""
-                        else:
-                            stage_log.append("Plan A: youtube-transcript-api (not installed)")
+                                st.session_state["yt_last_error"] = str(e)
+                                st.error(f"Auto-extract failed: {e}")
 
-                        # Plan B/B2/C: native
-                        if not raw_text:
-                            raw_text, native_log = get_native_youtube_transcript(video_id)
-                            stage_log.extend([f"Native: {x}" for x in native_log])
+                            with st.expander("Debug details", expanded=False):
+                                st.write(stage_log)
 
-                        if not raw_text or len(raw_text.strip()) < 20:
-                            raise ValueError("Transcript extraction returned empty text.")
+                    # 2) Assist Mode (always available)
+                    if st.session_state.get("yt_last_error"):
+                        st.markdown(
+                            f"<div class='warnbox'><b>YouTube Assist Mode</b><br/>"
+                            f"Hosted environments often can’t fetch transcripts directly. "
+                            f"Paste or upload the transcript below to continue.<br/>"
+                            f"<span class='smallhelp'>Last error: {html.escape(st.session_state['yt_last_error'])}</span></div>",
+                            unsafe_allow_html=True
+                        )
+                    else:
+                        st.markdown(
+                            "<div class='warnbox'><b>YouTube Assist Mode</b><br/>"
+                            "If auto-extract fails, paste or upload the transcript here (recommended for Streamlit hosting).</div>",
+                            unsafe_allow_html=True
+                        )
 
-                        st.success("Transcript Extracted Successfully!")
-                        with st.expander("Preview & Edit Transcript", expanded=True):
-                            content_text = st.text_area("Edit text before generating:", raw_text, height=200)
+                    tcol1, tcol2 = st.columns([1, 1])
 
-                        with st.expander("Debug details", expanded=False):
-                            st.write(stage_log)
+                    with tcol1:
+                        up = st.file_uploader(
+                            "Upload transcript file (.txt .vtt .srt .json .xml)",
+                            type=["txt", "vtt", "srt", "json", "xml"],
+                            key="yt_transcript_upload"
+                        )
+                        if up is not None:
+                            parsed, err = parse_uploaded_transcript(up)
+                            if err:
+                                st.error(err)
+                            else:
+                                st.session_state["yt_assist_text"] = parsed
+                                st.success("Transcript file parsed and loaded into editor.")
 
-                    except Exception as e:
-                        st.error(f"Error extracting transcript: {str(e)}")
+                    with tcol2:
+                        st.markdown(
+                            "<div class='smallhelp'><b>How to get a transcript from YouTube</b><br/>"
+                            "Open the video on YouTube → click <b>…</b> (More) → <b>Show transcript</b> → "
+                            "copy all text and paste below. Or download captions if available.</div>",
+                            unsafe_allow_html=True
+                        )
+
+                    with st.expander("Preview & Edit Transcript", expanded=True):
+                        content_text = st.text_area(
+                            "Transcript (paste/edit here):",
+                            value=st.session_state.get("yt_assist_text", ""),
+                            height=220
+                        )
+                        # keep in session for persistence
+                        st.session_state["yt_assist_text"] = content_text
 
         elif source_type == "Web Article":
             url = st.text_input("Article URL")
