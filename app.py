@@ -24,7 +24,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 # ====================== 1. SAFE IMPORTS & CONFIGURATION ======================
 st.set_page_config(
-    page_title="Flashcard Library Pro v7.0",
+    page_title="Flashcard Library Pro v7.1",
     page_icon="🧠",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -159,18 +159,30 @@ def extract_pdf_text(uploaded_file):
     except Exception as e:
         return None, f"Error reading PDF: {str(e)}"
 
-def extract_youtube_id(url):
+def extract_youtube_id(url: str) -> Optional[str]:
+    if not url:
+        return None
+    url = url.strip()
+
     parsed_url = urllib.parse.urlparse(url)
+
     if parsed_url.hostname == 'youtu.be':
-        return parsed_url.path[1:]
+        vid = parsed_url.path[1:]
+        return vid if re.fullmatch(r"[0-9A-Za-z_-]{11}", vid or "") else None
+
     if parsed_url.hostname in ('www.youtube.com', 'youtube.com', 'm.youtube.com'):
         if parsed_url.path == '/watch':
-            return urllib.parse.parse_qs(parsed_url.query).get('v', [None])[0]
+            vid = urllib.parse.parse_qs(parsed_url.query).get('v', [None])[0]
+            return vid if re.fullmatch(r"[0-9A-Za-z_-]{11}", vid or "") else None
         if parsed_url.path.startswith(('/shorts/', '/embed/', '/v/')):
             parts = parsed_url.path.split('/')
-            return parts[2] if len(parts) > 2 else None
-    match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11}).*', url)
-    return match.group(1) if match else None
+            vid = parts[2] if len(parts) > 2 else None
+            return vid if re.fullmatch(r"[0-9A-Za-z_-]{11}", vid or "") else None
+
+    # final fallback: regex search anywhere in the string
+    match = re.search(r'([0-9A-Za-z_-]{11})', url)
+    vid = match.group(1) if match else None
+    return vid if re.fullmatch(r"[0-9A-Za-z_-]{11}", vid or "") else None
 
 def _normalize_transcript_text(text: str) -> str:
     if not text:
@@ -182,23 +194,30 @@ def _normalize_transcript_text(text: str) -> str:
 TRANSCRIPT_MIN_CHARS = 200
 
 @st.cache_data(show_spinner=False, ttl=60 * 60)
-def fetch_transcript_via_worker(worker_base_url: str, video_id: str) -> Tuple[str, List[str]]:
+def fetch_transcript_via_worker(worker_base_url: str, video_id: str, debug: bool = False) -> Tuple[str, List[str]]:
     logs: List[str] = []
     if not worker_base_url:
         return "", ["Worker URL missing"]
     worker_base_url = worker_base_url.strip().rstrip("/")
 
+    if not re.fullmatch(r"[0-9A-Za-z_-]{11}", video_id or ""):
+        return "", [f"Bad video_id (must be 11 chars): {video_id!r}"]
+
     url = f"{worker_base_url}/transcript?video_id={video_id}&lang=en"
+    if debug:
+        url += "&debug=1"
     logs.append(f"GET {url}")
 
     try:
         r = requests.get(url, timeout=25)
         logs.append(f"status={r.status_code} len={len(r.text)}")
         if not r.ok:
-            return "", logs + [f"http_error={r.status_code} body_head={r.text[:120]}"]
+            return "", logs + [f"http_error={r.status_code} body_head={r.text[:200]}"]
         data = r.json()
         if not data.get("ok"):
             return "", logs + [f"ok=false error={data.get('error')} detail={data.get('detail')}"]
+        if debug and data.get("logs"):
+            logs.append(f"worker_logs={data.get('logs')}")
         text = _normalize_transcript_text(data.get("text", ""))
         logs.append(f"transcript_chars={len(text)} lang={data.get('lang')} kind={data.get('kind')}")
         if len(text) < TRANSCRIPT_MIN_CHARS:
@@ -321,43 +340,49 @@ def section_generator(api_key: str, worker_base_url: str):
                 content_text = "Generate flashcards based on this image."
 
         elif source_type == "YouTube URL":
-            url = st.text_input("Video URL")
+            url = st.text_input(
+                "YouTube Video URL (paste the YouTube link here, not the Worker URL)",
+                placeholder="https://www.youtube.com/watch?v=hDkiMiPBz5U"
+            )
             show_debug = st.toggle("Show transcript debug logs", value=False)
 
             if url:
                 video_id = extract_youtube_id(url)
+
                 if not video_id:
-                    st.error("Invalid YouTube URL (couldn't detect video ID).")
+                    st.error("Invalid YouTube URL: could not extract a valid 11-character video ID.")
                 else:
-                    st.caption(f"Video ID: {video_id}")
+                    st.caption(f"Extracted video_id = {video_id}")
 
                     if st.session_state.get("yt_last_video_id") != video_id:
                         st.session_state["yt_last_video_id"] = video_id
                         st.session_state["yt_last_error"] = ""
 
                         with st.spinner("Fetching transcript (via Worker)..."):
-                            t, logs = fetch_transcript_via_worker(worker_base_url, video_id)
+                            t, logs = fetch_transcript_via_worker(worker_base_url, video_id, debug=show_debug)
                             if t:
                                 st.session_state["yt_assist_text"] = t
                             else:
                                 st.session_state["yt_last_error"] = (
-                                    "Auto transcript failed. The video may have no captions or YouTube blocked the request. "
-                                    "You can still upload/paste transcript below."
+                                    "Auto transcript failed. Either: (1) video has no captions, (2) captions are restricted, "
+                                    "or (3) YouTube blocked the request. You can still paste transcript manually."
                                 )
+
                         if show_debug:
                             with st.expander("Debug details", expanded=False):
                                 st.write(logs)
 
                     if st.button("🔁 Retry transcript fetch", use_container_width=True):
                         with st.spinner("Retrying (via Worker)..."):
-                            t, logs = fetch_transcript_via_worker(worker_base_url, video_id)
+                            t, logs = fetch_transcript_via_worker(worker_base_url, video_id, debug=show_debug)
                             if t:
                                 st.session_state["yt_assist_text"] = t
                                 st.session_state["yt_last_error"] = ""
                                 st.success("Transcript fetched.")
                             else:
-                                st.session_state["yt_last_error"] = "Retry failed. Upload/paste transcript below."
+                                st.session_state["yt_last_error"] = "Retry failed. Paste transcript below."
                                 st.warning(st.session_state["yt_last_error"])
+
                             if show_debug:
                                 with st.expander("Debug details", expanded=False):
                                     st.write(logs)
@@ -404,7 +429,7 @@ def section_generator(api_key: str, worker_base_url: str):
                 st.warning("No valid content")
                 return
             if source_type == "YouTube URL" and (not content_text or len(content_text.strip()) < TRANSCRIPT_MIN_CHARS):
-                st.warning("Transcript is empty/too short. Try another video or paste/upload transcript.")
+                st.warning("Transcript is empty/too short. Try another video or paste transcript.")
                 return
 
             with st.spinner("Gemini is thinking..."):
@@ -517,7 +542,6 @@ def section_study():
             for i, col in enumerate(cols):
                 col.button(labels[i], use_container_width=True, on_click=cb_submit_review, args=(scores[i], card['id']))
     else:
-        st.balloons()
         st.subheader("🏁 Complete!")
         stats = st.session_state["session_stats"]
         acc = int((stats["correct"] / stats["reviewed"] * 100)) if stats["reviewed"] else 0
@@ -618,8 +642,8 @@ def main():
         api_key = st.text_input("Gemini API Key", type="password")
         worker_base_url = st.text_input(
             "Transcript Worker Base URL",
-            placeholder="https://yt-transcript-proxy.YOURNAME.workers.dev",
-            help="Deploy the Cloudflare Worker and paste its base URL here (no /transcript)."
+            placeholder="https://yt-transcripts-proxy.hasannaufalaqill.workers.dev",
+            help="Paste your Cloudflare Worker base URL here (no /transcript)."
         )
         st.metric("Cards Due Today", get_due_cards_count())
         st.divider()
