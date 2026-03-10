@@ -9,7 +9,6 @@ import json
 import time
 import io
 import base64
-import html
 from datetime import datetime, timedelta
 import altair as alt
 
@@ -24,7 +23,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 # ====================== 1. SAFE IMPORTS & CONFIGURATION ======================
 st.set_page_config(
-    page_title="Flashcard Library Pro v6.6", 
+    page_title="Flashcard Library Pro v6.7", 
     page_icon="🧠", 
     layout="wide",
     initial_sidebar_state="expanded"
@@ -35,6 +34,12 @@ try:
     BS4_AVAILABLE = True
 except ImportError:
     BS4_AVAILABLE = False
+
+try:
+    from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
+    YOUTUBE_AVAILABLE = True
+except ImportError:
+    YOUTUBE_AVAILABLE = False
 
 try:
     from pypdf import PdfReader
@@ -151,90 +156,9 @@ def extract_pdf_text(uploaded_file):
         return None, f"Error reading PDF: {str(e)}"
 
 def extract_youtube_id(url):
-    parsed_url = urllib.parse.urlparse(url)
-    if parsed_url.hostname == 'youtu.be':
-        return parsed_url.path[1:]
-    if parsed_url.hostname in ('www.youtube.com', 'youtube.com'):
-        if parsed_url.path == '/watch':
-            return urllib.parse.parse_qs(parsed_url.query).get('v', [None])[0]
-        if parsed_url.path.startswith(('/shorts/', '/embed/', '/v/')):
-            return parsed_url.path.split('/')[2]
-    match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11}).*', url)
+    """Robust regex to grab ONLY the 11-character video ID."""
+    match = re.search(r'(?:v=|\/|youtu\.be\/)([0-9A-Za-z_-]{11}).*', url)
     return match.group(1) if match else None
-
-def get_decentralized_transcript(video_id):
-    """
-    Zero-dependency extractor routing through a Decentralized Proxy Network.
-    Bypasses broken pip libraries, IP Bans, and Bot Walls entirely.
-    """
-    def parse_vtt(vtt_text):
-        lines = []
-        for line in vtt_text.split('\n'):
-            line = line.strip()
-            # Skip VTT formatting lines and metadata
-            if not line or '-->' in line or line.startswith('WEBVTT') or line.startswith('Kind:') or line.startswith('Language:') or line.startswith('Style:'):
-                continue
-            # Strip inline HTML and timestamp tags
-            clean_line = re.sub(r'<[^>]+>', '', line).strip()
-            if clean_line:
-                # Basic deduplication for roll-up captions
-                if not lines or lines[-1] != clean_line:
-                    lines.append(clean_line)
-        return " ".join(lines)
-
-    # 1. Try Piped API Network
-    piped_instances = [
-        "https://pipedapi.kavin.rocks",
-        "https://pipedapi.tokhmi.xyz",
-        "https://pipedapi.smnz.de",
-        "https://piapi.ggtyler.dev",
-        "https://piped-api.lunar.icu"
-    ]
-    
-    for instance in piped_instances:
-        try:
-            resp = requests.get(f"{instance}/streams/{video_id}", timeout=10)
-            if resp.status_code == 200:
-                subs = resp.json().get("subtitles", [])
-                if subs:
-                    # Prefer English manual, then English auto, then anything
-                    en_subs = [s for s in subs if s.get('code', '').startswith('en')]
-                    target_sub = en_subs[0] if en_subs else subs[0]
-                    
-                    vtt_resp = requests.get(target_sub['url'], timeout=10)
-                    if vtt_resp.status_code == 200:
-                        text = parse_vtt(vtt_resp.text)
-                        if len(text) > 50:
-                            return text
-        except:
-            continue
-
-    # 2. Try Invidious API Network Fallback
-    invidious_instances = [
-        "https://vid.puffyan.us",
-        "https://invidious.jing.rocks",
-        "https://yewtu.be"
-    ]
-    
-    for instance in invidious_instances:
-        try:
-            resp = requests.get(f"{instance}/api/v1/captions/{video_id}", timeout=10)
-            if resp.status_code == 200:
-                data = resp.json()
-                captions = data.get("captions", [])
-                if captions:
-                    en_caps = [c for c in captions if c.get('languageCode', '').startswith('en')]
-                    target_cap = en_caps[0] if en_caps else captions[0]
-                    
-                    vtt_resp = requests.get(f"{instance}{target_cap['url']}", timeout=10)
-                    if vtt_resp.status_code == 200:
-                        text = parse_vtt(vtt_resp.text)
-                        if len(text) > 50:
-                            return text
-        except:
-            continue
-            
-    raise ValueError("Decentralized proxy network failed to extract subtitles. The video may not have captions.")
 
 def clean_web_markdown(text):
     text = re.sub(r'<HTML.*?>.*?</HTML>', '', text, flags=re.IGNORECASE | re.DOTALL)
@@ -331,23 +255,43 @@ def section_generator(api_key):
                 content_text = "Generate flashcards based on this image."
 
         elif source_type == "YouTube URL":
-            url = st.text_input("Video URL")
-            if url:
-                with st.spinner("Bypassing IP Blocks & Extracting..."):
-                    try:
-                        video_id = extract_youtube_id(url)
-                        if not video_id:
-                            raise ValueError("Invalid YouTube URL.")
-                        
-                        # Use the Decentralized Network
-                        raw_text = get_decentralized_transcript(video_id)
-                        
-                        st.success("Transcript Extracted Successfully!")
-                        with st.expander("Preview & Edit Transcript", expanded=True):
-                            content_text = st.text_area("Edit text before generating:", raw_text, height=200)
+            if not YOUTUBE_AVAILABLE:
+                st.warning("Please install 'youtube-transcript-api'")
+            else:
+                url = st.text_input("Video URL")
+                if url:
+                    with st.spinner("Connecting to official YouTube API..."):
+                        try:
+                            video_id = extract_youtube_id(url)
+                            if not video_id:
+                                raise ValueError("Could not detect a valid 11-character YouTube ID.")
+
+                            transcript_data = None
                             
-                    except Exception as e: 
-                        st.error(f"Error extracting transcript: {str(e)}")
+                            # Attempt 1: Standard English Check
+                            try:
+                                transcript_data = YouTubeTranscriptApi.get_transcript(video_id, languages=['en', 'en-US', 'en-GB'])
+                            except (TranscriptsDisabled, NoTranscriptFound):
+                                # Attempt 2: Pull the list of ALL transcripts and force it to fetch the first available one (auto-generated)
+                                transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+                                for transcript in transcript_list:
+                                    transcript_data = transcript.fetch()
+                                    break
+                                    
+                            if not transcript_data:
+                                raise ValueError("No translatable captions exist for this video.")
+
+                            # Clean the data into a single string
+                            raw_text = " ".join([t['text'] for t in transcript_data])
+                            
+                            st.success("Transcript Extracted Successfully!")
+                            with st.expander("Preview & Edit Transcript", expanded=True):
+                                content_text = st.text_area("Edit text before generating:", raw_text, height=200)
+
+                        except TranscriptsDisabled:
+                            st.error("The creator disabled subtitles for this video.")
+                        except Exception as e: 
+                            st.error(f"Library Error: {str(e)}")
 
         elif source_type == "Web Article":
             url = st.text_input("Article URL")
