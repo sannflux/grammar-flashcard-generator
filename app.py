@@ -55,7 +55,6 @@ DEFAULT_STATE = {
     "show_answer": False,
     "session_stats": {"reviewed": 0, "correct": 0, "start_time": None},
     "cram_mode": False,
-    # YouTube Assist Mode state
     "yt_assist_text": "",
     "yt_last_error": "",
 }
@@ -260,17 +259,12 @@ def _parse_transcript_auto(text: str) -> str:
         if parsed:
             return parsed
 
-    # If it's plain text already
     if len(text.strip()) > 20 and "<html" not in text.lower():
         return _normalize_transcript_text([text])
 
     return ""
 
 def parse_uploaded_transcript(uploaded_file) -> Tuple[str, Optional[str]]:
-    """
-    Supports txt, vtt, srt, json (json3), xml.
-    Returns (text, error_msg).
-    """
     try:
         raw_bytes = uploaded_file.getvalue()
         raw = raw_bytes.decode("utf-8", errors="ignore")
@@ -317,7 +311,6 @@ def get_youtube_transcript_via_library(video_id: str, preferred_langs: Optional[
     data = first.fetch()
     return _normalize_transcript_text([x.get("text", "") for x in data])
 
-# NOTE: We keep the native extractor code as best-effort, but hosted infra may block it.
 def get_native_youtube_transcript(video_id: str) -> Tuple[str, List[str]]:
     stage_log = []
     headers = {
@@ -326,7 +319,6 @@ def get_native_youtube_transcript(video_id: str) -> Tuple[str, List[str]]:
     }
     cookies = {"CONSENT": "YES+cb.20210328-17-p0.en+FX+478"}
 
-    # Timedtext list
     try:
         params = {"v": video_id, "type": "list"}
         r = requests.get("https://www.youtube.com/api/timedtext", params=params, headers=headers, cookies=cookies, timeout=15)
@@ -483,103 +475,88 @@ def section_generator(api_key):
 
         elif source_type == "YouTube URL":
             url = st.text_input("Video URL")
-            if url:
-                video_id = extract_youtube_id(url)
-                if not video_id:
-                    st.error("Invalid YouTube URL.")
-                else:
-                    st.caption(f"Video ID: {video_id}")
+            video_id = extract_youtube_id(url) if url else None
 
-                    # 1) Try automated extraction (best-effort)
-                    raw_text = ""
-                    stage_log = []
+            if url and not video_id:
+                st.error("Invalid YouTube URL (couldn't detect video ID).")
 
-                    if st.button("🔎 Try Auto-Extract Transcript", use_container_width=True):
-                        with st.spinner("Attempting auto-extraction..."):
-                            st.session_state["yt_last_error"] = ""
+            if video_id:
+                st.caption(f"Video ID: {video_id}")
+
+                # Auto extract is OPTIONAL
+                if st.button("🔎 Try Auto-Extract Transcript (optional)", use_container_width=True):
+                    with st.spinner("Attempting auto-extraction..."):
+                        st.session_state["yt_last_error"] = ""
+                        stage_log = []
+                        raw_text = ""
+
+                        # Plan A
+                        if YOUTUBE_AVAILABLE:
                             try:
-                                # Plan A: youtube-transcript-api
-                                if YOUTUBE_AVAILABLE:
-                                    try:
-                                        raw_text = get_youtube_transcript_via_library(video_id)
-                                        stage_log.append("Plan A: youtube-transcript-api ✅")
-                                    except (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable) as e:
-                                        stage_log.append(f"Plan A: youtube-transcript-api ❌ ({type(e).__name__})")
-                                        raw_text = ""
-                                    except Exception as e:
-                                        stage_log.append(f"Plan A: youtube-transcript-api ❌ ({type(e).__name__})")
-                                        raw_text = ""
-                                else:
-                                    stage_log.append("Plan A: youtube-transcript-api (not installed)")
-
-                                # Plan B: native timedtext (often blocked on hosted infra)
-                                if not raw_text:
-                                    try:
-                                        raw_text, native_log = get_native_youtube_transcript(video_id)
-                                        stage_log.extend([f"Native: {x}" for x in native_log])
-                                    except Exception as e:
-                                        stage_log.append(f"Native: ❌ ({str(e)})")
-
-                                if not raw_text or len(raw_text.strip()) < 20:
-                                    raise ValueError("Auto-extraction failed (common on hosted Streamlit due to YouTube blocking).")
-
-                                st.session_state["yt_assist_text"] = raw_text
-                                st.success("Transcript extracted. Loaded into editor below.")
+                                raw_text = get_youtube_transcript_via_library(video_id)
+                                stage_log.append("Plan A: youtube-transcript-api ✅")
                             except Exception as e:
-                                st.session_state["yt_last_error"] = str(e)
-                                st.error(f"Auto-extract failed: {e}")
+                                stage_log.append(f"Plan A: youtube-transcript-api ❌ ({type(e).__name__})")
+                                raw_text = ""
+                        else:
+                            stage_log.append("Plan A: youtube-transcript-api (not installed)")
 
-                            with st.expander("Debug details", expanded=False):
-                                st.write(stage_log)
+                        # Plan B
+                        if not raw_text:
+                            try:
+                                raw_text, native_log = get_native_youtube_transcript(video_id)
+                                stage_log.extend([f"Native: {x}" for x in native_log])
+                            except Exception as e:
+                                stage_log.append(f"Native: ❌ ({str(e)})")
 
-                    # 2) Assist Mode (always available)
-                    if st.session_state.get("yt_last_error"):
-                        st.markdown(
-                            f"<div class='warnbox'><b>YouTube Assist Mode</b><br/>"
-                            f"Hosted environments often can’t fetch transcripts directly. "
-                            f"Paste or upload the transcript below to continue.<br/>"
-                            f"<span class='smallhelp'>Last error: {html.escape(st.session_state['yt_last_error'])}</span></div>",
-                            unsafe_allow_html=True
-                        )
-                    else:
-                        st.markdown(
-                            "<div class='warnbox'><b>YouTube Assist Mode</b><br/>"
-                            "If auto-extract fails, paste or upload the transcript here (recommended for Streamlit hosting).</div>",
-                            unsafe_allow_html=True
-                        )
+                        if raw_text and len(raw_text.strip()) > 20:
+                            st.session_state["yt_assist_text"] = raw_text
+                            st.success("Transcript extracted and loaded into editor.")
+                        else:
+                            st.session_state["yt_last_error"] = "Auto-extraction failed (common on hosted Streamlit due to YouTube blocking)."
+                            st.warning(st.session_state["yt_last_error"])
 
-                    tcol1, tcol2 = st.columns([1, 1])
+                        with st.expander("Debug details", expanded=False):
+                            st.write(stage_log)
 
-                    with tcol1:
-                        up = st.file_uploader(
-                            "Upload transcript file (.txt .vtt .srt .json .xml)",
-                            type=["txt", "vtt", "srt", "json", "xml"],
-                            key="yt_transcript_upload"
-                        )
-                        if up is not None:
-                            parsed, err = parse_uploaded_transcript(up)
-                            if err:
-                                st.error(err)
-                            else:
-                                st.session_state["yt_assist_text"] = parsed
-                                st.success("Transcript file parsed and loaded into editor.")
+                # Assist Mode is ALWAYS visible (never blocked)
+                st.markdown(
+                    "<div class='warnbox'><b>YouTube Assist Mode</b><br/>"
+                    "If auto-extract fails, paste or upload the transcript below and continue. "
+                    "<span class='smallhelp'>This is the reliable method on Streamlit hosting.</span></div>",
+                    unsafe_allow_html=True
+                )
 
-                    with tcol2:
-                        st.markdown(
-                            "<div class='smallhelp'><b>How to get a transcript from YouTube</b><br/>"
-                            "Open the video on YouTube → click <b>…</b> (More) → <b>Show transcript</b> → "
-                            "copy all text and paste below. Or download captions if available.</div>",
-                            unsafe_allow_html=True
-                        )
+                tcol1, tcol2 = st.columns([1, 1])
+                with tcol1:
+                    up = st.file_uploader(
+                        "Upload transcript file (.txt .vtt .srt .json .xml)",
+                        type=["txt", "vtt", "srt", "json", "xml"],
+                        key="yt_transcript_upload"
+                    )
+                    if up is not None:
+                        parsed, err = parse_uploaded_transcript(up)
+                        if err:
+                            st.error(err)
+                        else:
+                            st.session_state["yt_assist_text"] = parsed
+                            st.success("Transcript file parsed and loaded into editor.")
 
-                    with st.expander("Preview & Edit Transcript", expanded=True):
-                        content_text = st.text_area(
-                            "Transcript (paste/edit here):",
-                            value=st.session_state.get("yt_assist_text", ""),
-                            height=220
-                        )
-                        # keep in session for persistence
-                        st.session_state["yt_assist_text"] = content_text
+                with tcol2:
+                    st.markdown(
+                        "<div class='smallhelp'><b>How to get a transcript</b><br/>"
+                        "Open the video on YouTube → click <b>…</b> → <b>Show transcript</b> → copy/paste here.<br/>"
+                        "If the video has no transcript, use your own notes or a summary.</div>",
+                        unsafe_allow_html=True
+                    )
+
+                with st.expander("Preview & Edit Transcript", expanded=True):
+                    st.session_state["yt_assist_text"] = st.text_area(
+                        "Transcript (paste/edit here):",
+                        value=st.session_state.get("yt_assist_text", ""),
+                        height=220
+                    )
+                    content_text = st.session_state["yt_assist_text"]
 
         elif source_type == "Web Article":
             url = st.text_input("Article URL")
@@ -605,6 +582,9 @@ def section_generator(api_key):
                 return
             if not (content_text or image_content):
                 st.warning("No valid content")
+                return
+            if content_text and len(content_text.strip()) < 20 and source_type == "YouTube URL":
+                st.warning("Transcript is too short. Paste/upload the transcript in Assist Mode.")
                 return
 
             with st.spinner("Gemini is thinking..."):
