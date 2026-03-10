@@ -183,29 +183,18 @@ def _normalize_transcript_text(chunks: List[str]) -> str:
     return text
 
 def _parse_transcript_xml(xml_text: str) -> str:
-    # YouTube timedtext XML: <text start="..." dur="...">hello</text>
-    # Extract inner text safely without nuking everything via regex.
-    # Still use regex for simplicity, but only to capture <text> bodies.
     bodies = re.findall(r'<text[^>]*>(.*?)</text>', xml_text, flags=re.DOTALL | re.IGNORECASE)
-    bodies = [re.sub(r'&#39;', "'", b) for b in bodies]
-    bodies = [re.sub(r'&quot;', '"', b) for b in bodies]
-    bodies = [re.sub(r'&amp;', '&', b) for b in bodies]
-    bodies = [re.sub(r'<[^>]+>', ' ', b) for b in bodies]  # extremely rare nested tags
+    bodies = [html.unescape(b) for b in bodies]
+    bodies = [re.sub(r'<[^>]+>', ' ', b) for b in bodies]
     return _normalize_transcript_text(bodies)
 
 def get_youtube_transcript_via_library(video_id: str, preferred_langs: Optional[List[str]] = None) -> str:
-    """
-    Robust wrapper around youtube-transcript-api.
-    Uses list_transcripts() to select the best available transcript.
-    """
     if not YOUTUBE_AVAILABLE:
         raise RuntimeError("youtube-transcript-api not installed.")
 
     preferred_langs = preferred_langs or ["en", "en-US", "en-GB"]
-
     transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
 
-    # 1) Try preferred languages (manually created first, then generated)
     for lang in preferred_langs:
         try:
             t = transcript_list.find_manually_created_transcript([lang])
@@ -220,7 +209,6 @@ def get_youtube_transcript_via_library(video_id: str, preferred_langs: Optional[
         except Exception:
             pass
 
-    # 2) If we can translate, try translating the first available transcript into English
     try:
         for t in transcript_list:
             try:
@@ -232,50 +220,114 @@ def get_youtube_transcript_via_library(video_id: str, preferred_langs: Optional[
     except Exception:
         pass
 
-    # 3) Last resort: fetch the first transcript available
-    try:
-        first = next(iter(transcript_list))
-        data = first.fetch()
-        return _normalize_transcript_text([x.get("text", "") for x in data])
-    except Exception:
-        raise NoTranscriptFound(video_id)
+    first = next(iter(transcript_list))
+    data = first.fetch()
+    return _normalize_transcript_text([x.get("text", "") for x in data])
 
 def _extract_ytinitialplayerresponse(html_content: str) -> Optional[dict]:
-    """
-    Extract full ytInitialPlayerResponse JSON blob.
-    Memory Guard: do NOT attempt to parse captionTracks array directly via regex+json.loads.
-    """
-    # Common patterns:
-    # var ytInitialPlayerResponse = {...};
-    # ytInitialPlayerResponse = {...};
     m = re.search(r'ytInitialPlayerResponse\s*=\s*({.*?})\s*;', html_content, flags=re.DOTALL)
     if not m:
-        # Sometimes embedded as: "ytInitialPlayerResponse":{...},"ytInitialData"
         m = re.search(r'"ytInitialPlayerResponse"\s*:\s*({.*?})\s*,\s*"ytInitialData"', html_content, flags=re.DOTALL)
     if not m:
         return None
     blob = m.group(1)
-
-    # Try to load JSON; if fails, attempt minimal cleanup of JS escapes.
     try:
         return json.loads(blob)
     except Exception:
-        # Cleanup: remove newlines that can break some edge cases (still may fail)
         try:
             return json.loads(blob.replace("\n", " "))
         except Exception:
             return None
 
+def _discover_timedtext_tracks(video_id: str, headers: dict, cookies: dict) -> List[dict]:
+    """
+    Plan B: timedtext discovery endpoint.
+    Returns a list of tracks like: [{"lang_code":"en","name":"English","kind":"asr"}, ...]
+    """
+    params = {
+        "v": video_id,
+        "type": "list",
+    }
+    resp = requests.get("https://www.youtube.com/api/timedtext", params=params, headers=headers, cookies=cookies, timeout=15)
+    resp.raise_for_status()
+    text = resp.text
+
+    # If no captions, YouTube often returns empty string.
+    if not text or "<transcript_list" not in text:
+        return []
+
+    # Parse <track ... /> tags
+    tracks = []
+    for m in re.finditer(r'<track\b([^/>]*)\/?>', text, flags=re.IGNORECASE):
+        attrs = m.group(1)
+        lang_code = re.search(r'lang_code="([^"]+)"', attrs)
+        name = re.search(r'name="([^"]+)"', attrs)
+        kind = re.search(r'kind="([^"]+)"', attrs)
+        tracks.append({
+            "lang_code": lang_code.group(1) if lang_code else None,
+            "name": html.unescape(name.group(1)) if name else None,
+            "kind": kind.group(1) if kind else None,  # "asr" for auto
+        })
+    return [t for t in tracks if t.get("lang_code")]
+
+def _fetch_timedtext_xml(video_id: str, lang_code: str, headers: dict, cookies: dict, kind: Optional[str] = None) -> str:
+    params = {
+        "v": video_id,
+        "lang": lang_code,
+        "fmt": "srv3",  # more structured than vtt in many cases
+    }
+    if kind:
+        params["kind"] = kind  # "asr" for auto captions
+
+    resp = requests.get("https://www.youtube.com/api/timedtext", params=params, headers=headers, cookies=cookies, timeout=15)
+    resp.raise_for_status()
+    return resp.text
+
 def get_native_youtube_transcript(video_id: str) -> str:
-    """Fallback extractor using ytInitialPlayerResponse -> captionTracks -> timedtext XML."""
+    """
+    Multi-stage native extractor:
+    Plan B: timedtext discovery (works when captionTracks absent in HTML)
+    Plan C: ytInitialPlayerResponse captionTracks (legacy)
+    """
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Accept-Language": "en-US,en;q=0.9",
     }
     cookies = {"CONSENT": "YES+cb.20210328-17-p0.en+FX+478"}
 
-    watch_url = f"https://www.youtube.com/watch?v={video_id}"
+    # -------- Plan B: timedtext discovery --------
+    try:
+        tracks = _discover_timedtext_tracks(video_id, headers=headers, cookies=cookies)
+        if tracks:
+            # Prefer English manual first (kind None), then English ASR, else first track.
+            preferred = None
+            for t in tracks:
+                if t["lang_code"].startswith("en") and t.get("kind") is None:
+                    preferred = t
+                    break
+            if preferred is None:
+                for t in tracks:
+                    if t["lang_code"].startswith("en") and t.get("kind") == "asr":
+                        preferred = t
+                        break
+            if preferred is None:
+                preferred = tracks[0]
 
+            xml_text = _fetch_timedtext_xml(
+                video_id,
+                lang_code=preferred["lang_code"],
+                headers=headers,
+                cookies=cookies,
+                kind=preferred.get("kind")
+            )
+            parsed = _parse_transcript_xml(xml_text)
+            if parsed and len(parsed) > 20:
+                return parsed
+    except Exception:
+        pass
+
+    # -------- Plan C: ytInitialPlayerResponse captionTracks --------
+    watch_url = f"https://www.youtube.com/watch?v={video_id}"
     html_content = requests.get(watch_url, headers=headers, cookies=cookies, timeout=15).text
     player = _extract_ytinitialplayerresponse(html_content)
     if not player:
@@ -291,9 +343,8 @@ def get_native_youtube_transcript(video_id: str) -> str:
         tracks = []
 
     if not tracks:
-        raise ValueError("No caption tracks found. The video may not have captions enabled.")
+        raise ValueError("No caption tracks found via timedtext or watch HTML. The video may not have captions enabled.")
 
-    # Pick first track (usually best). Could be enhanced to prefer English.
     base_url = tracks[0].get("baseUrl")
     if not base_url:
         raise ValueError("Caption track baseUrl missing.")
@@ -422,20 +473,26 @@ def section_generator(api_key):
                             raise ValueError("Invalid YouTube URL.")
 
                         raw_text = ""
+                        errors = []
 
-                        # Plan A: youtube-transcript-api (robust selection)
+                        # Plan A: youtube-transcript-api
                         if YOUTUBE_AVAILABLE:
                             try:
                                 raw_text = get_youtube_transcript_via_library(video_id)
                             except (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable) as e:
-                                # Known library conditions; fall back to native extractor
+                                errors.append(f"Library: {type(e).__name__}")
                                 raw_text = ""
-                            except Exception:
+                            except Exception as e:
+                                errors.append(f"Library: {type(e).__name__}")
                                 raw_text = ""
 
-                        # Plan B: Native fallback (ytInitialPlayerResponse parsing)
+                        # Plan B/C: Native extractor (timedtext discovery -> HTML)
                         if not raw_text:
-                            raw_text = get_native_youtube_transcript(video_id)
+                            try:
+                                raw_text = get_native_youtube_transcript(video_id)
+                            except Exception as e:
+                                errors.append(f"Native: {type(e).__name__}")
+                                raise
 
                         if not raw_text or len(raw_text.strip()) < 20:
                             raise ValueError("Transcript extraction returned empty text.")
@@ -443,6 +500,10 @@ def section_generator(api_key):
                         st.success("Transcript Extracted Successfully!")
                         with st.expander("Preview & Edit Transcript", expanded=True):
                             content_text = st.text_area("Edit text before generating:", raw_text, height=200)
+
+                        if errors:
+                            with st.expander("Debug details", expanded=False):
+                                st.write(errors)
 
                     except Exception as e:
                         st.error(f"Error extracting transcript: {str(e)}")
