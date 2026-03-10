@@ -9,6 +9,7 @@ import json
 import time
 import io
 import base64
+import traceback
 from datetime import datetime, timedelta
 import altair as alt
 
@@ -23,7 +24,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 # ====================== 1. SAFE IMPORTS & CONFIGURATION ======================
 st.set_page_config(
-    page_title="Flashcard Library Pro v6.9", 
+    page_title="Flashcard Library Pro v7.0", 
     page_icon="🧠", 
     layout="wide",
     initial_sidebar_state="expanded"
@@ -36,6 +37,7 @@ except ImportError:
     BS4_AVAILABLE = False
 
 try:
+    import youtube_transcript_api
     from youtube_transcript_api import YouTubeTranscriptApi
     YOUTUBE_AVAILABLE = True
 except ImportError:
@@ -260,30 +262,42 @@ def section_generator(api_key):
             else:
                 url = st.text_input("Video URL")
                 if url:
-                    with st.spinner("Fetching Official Transcript..."):
-                        try:
-                            video_id = extract_youtube_id(url)
-                            if not video_id:
-                                raise ValueError("Could not detect a valid 11-character YouTube ID.")
-
-                            # Old-school fallback using ONLY get_transcript (Compatible with older pip versions)
-                            # We pass a massive list of fallback languages so it works on almost any video without needing list_transcripts()
-                            fallback_languages = ['en', 'en-US', 'en-GB', 'es', 'fr', 'de', 'it', 'pt', 'ja', 'ko', 'zh-CN', 'ru', 'hi', 'ar', 'nl', 'tr']
-                            
-                            transcript_data = YouTubeTranscriptApi.get_transcript(video_id, languages=fallback_languages)
-                            
-                            if not transcript_data:
-                                raise ValueError("No translatable captions exist for this video.")
-
-                            # Clean the data into a single string
-                            raw_text = " ".join([t['text'] for t in transcript_data])
-                            
-                            st.success("Transcript Extracted Successfully!")
-                            with st.expander("Preview & Edit Transcript", expanded=True):
-                                content_text = st.text_area("Edit text before generating:", raw_text, height=200)
+                    with st.spinner("Extracting..."):
+                        video_id = extract_youtube_id(url)
+                        if not video_id:
+                            st.error("Could not extract a valid 11-character YouTube ID from the URL.")
+                        else:
+                            try:
+                                # Safe call using ONLY get_transcript to bypass missing attribute bugs
+                                fallback_langs = ['en', 'en-US', 'en-GB', 'es', 'fr', 'de', 'ja', 'ko', 'hi']
+                                try:
+                                    transcript_data = YouTubeTranscriptApi.get_transcript(video_id, languages=fallback_langs)
+                                except Exception:
+                                    transcript_data = YouTubeTranscriptApi.get_transcript(video_id)
+                                    
+                                raw_text = " ".join([t['text'] for t in transcript_data])
+                                st.success("Transcript Extracted Successfully!")
+                                with st.expander("Preview & Edit Transcript", expanded=True):
+                                    content_text = st.text_area("Edit text before generating:", raw_text, height=200)
+                                    
+                            except Exception as e:
+                                # ================= THE DIAGNOSTIC ENGINE =================
+                                lib_path = getattr(youtube_transcript_api, '__file__', 'Unknown Path')
+                                version = getattr(youtube_transcript_api, '__version__', 'Unknown Version')
                                 
-                        except Exception as e: 
-                            st.error(f"❌ Error: {str(e)}")
+                                st.error("❌ YouTube Extraction Failed.")
+                                st.error(f"**Error Message:** {str(e)}")
+                                
+                                st.warning("We need to diagnose why your environment is rejecting the library. Please copy the text below and send it to the engineer:")
+                                with st.expander("🔍 DEEP DIAGNOSTIC LOGS (Copy Me)", expanded=True):
+                                    st.code(f"""
+Video ID: {video_id}
+Library Version: {version}
+Library Path: {lib_path}
+
+Raw Traceback:
+{traceback.format_exc()}
+                                    """, language="text")
 
         elif source_type == "Web Article":
             url = st.text_input("Article URL")
@@ -443,42 +457,4 @@ def section_library():
 
     with t2:
         if not df_cards.empty:
-            edited = st.data_editor(df_cards[['id', 'front', 'back', 'explanation', 'tag']], hide_index=True, use_container_width=True, disabled=["id"])
-            if st.button("💾 Save to DB", type="primary"):
-                with get_db_connection() as conn:
-                    for _, r in edited.iterrows(): conn.execute("UPDATE cards SET front=?, back=?, explanation=?, tag=? WHERE id=?", (r['front'], r['back'], r['explanation'], r['tag'], r['id']))
-                    conn.commit()
-                st.success("Updated!")
-
-    with t3:
-        export_deck = st.selectbox("Export Deck", decks['name'].tolist())
-        deck_id_raw = decks[decks['name'] == export_deck].iloc[0]['id']
-        with get_db_connection() as conn: cards_df = pd.read_sql("SELECT front, back, tag FROM cards WHERE deck_id=?", conn, params=(int(deck_id_raw),))
-        st.download_button("Download CSV", data=cards_df.to_csv(index=False, header=False).encode('utf-8') if not cards_df.empty else b"", file_name=f"{export_deck}.csv", disabled=cards_df.empty)
-
-    with t4:
-        c1, c2 = st.columns(2)
-        with c1:
-            ren = st.selectbox("Rename", decks['name'].tolist(), key="r_sel")
-            new_n = st.text_input("New Name")
-            if st.button("Rename") and new_n:
-                if rename_deck(ren, new_n): st.success("Done!"); time.sleep(1); st.rerun()
-                else: st.error("Name exists.")
-        with c2:
-            d_del = st.selectbox("Delete", decks['name'].tolist(), key="d_sel")
-            if st.button(f"🗑️ Delete {d_del}"): delete_deck(d_del); st.rerun()
-
-def main():
-    inject_custom_css()
-    with st.sidebar:
-        st.title("🧠 Flashcard Pro")
-        api_key = st.text_input("Gemini API Key", type="password")
-        st.metric("Cards Due Today", get_due_cards_count())
-        st.divider()
-        page = st.radio("Navigation", ["Study Mode", "Generator", "Library & Stats"], label_visibility="collapsed")
-    
-    if page == "Generator": section_generator(api_key)
-    elif page == "Study Mode": section_study()
-    elif page == "Library & Stats": section_library()
-
-if __name__ == "__main__": main()
+            edited = st
