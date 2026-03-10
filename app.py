@@ -24,7 +24,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 # ====================== 1. SAFE IMPORTS & CONFIGURATION ======================
 st.set_page_config(
-    page_title="Flashcard Library Pro v6.5", 
+    page_title="Flashcard Library Pro v6.6", 
     page_icon="🧠", 
     layout="wide",
     initial_sidebar_state="expanded"
@@ -162,62 +162,79 @@ def extract_youtube_id(url):
     match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11}).*', url)
     return match.group(1) if match else None
 
-def get_internal_youtube_transcript(video_id):
+def get_decentralized_transcript(video_id):
     """
-    Zero-Dependency, Bot-Wall Immune Extractor.
-    Communicates directly with Google's mobile JSON API endpoint.
+    Zero-dependency extractor routing through a Decentralized Proxy Network.
+    Bypasses broken pip libraries, IP Bans, and Bot Walls entirely.
     """
-    url = "https://www.youtube.com/youtubei/v1/player"
-    headers = {"Content-Type": "application/json"}
-    
-    # Masquerade as an Android Client to bypass Web Bot Walls
-    payload = {
-        "context": {
-            "client": {
-                "clientName": "ANDROID",
-                "clientVersion": "17.31.35",
-                "androidSdkVersion": 30,
-                "hl": "en"
-            }
-        },
-        "videoId": video_id
-    }
-    
-    try:
-        resp = requests.post(url, json=payload, headers=headers, timeout=10)
-        data = resp.json()
-        captions = data.get("captions", {}).get("playerCaptionsTracklistRenderer", {}).get("captionTracks", [])
-        
-        # Fallback to WEB client if Android fails
-        if not captions:
-            payload["context"]["client"]["clientName"] = "WEB"
-            payload["context"]["client"]["clientVersion"] = "2.20240105.01.00"
-            resp = requests.post(url, json=payload, headers=headers, timeout=10)
-            data = resp.json()
-            captions = data.get("captions", {}).get("playerCaptionsTracklistRenderer", {}).get("captionTracks", [])
+    def parse_vtt(vtt_text):
+        lines = []
+        for line in vtt_text.split('\n'):
+            line = line.strip()
+            # Skip VTT formatting lines and metadata
+            if not line or '-->' in line or line.startswith('WEBVTT') or line.startswith('Kind:') or line.startswith('Language:') or line.startswith('Style:'):
+                continue
+            # Strip inline HTML and timestamp tags
+            clean_line = re.sub(r'<[^>]+>', '', line).strip()
+            if clean_line:
+                # Basic deduplication for roll-up captions
+                if not lines or lines[-1] != clean_line:
+                    lines.append(clean_line)
+        return " ".join(lines)
 
-        if not captions:
-            raise ValueError("No captions or auto-captions exist for this video.")
+    # 1. Try Piped API Network
+    piped_instances = [
+        "https://pipedapi.kavin.rocks",
+        "https://pipedapi.tokhmi.xyz",
+        "https://pipedapi.smnz.de",
+        "https://piapi.ggtyler.dev",
+        "https://piped-api.lunar.icu"
+    ]
+    
+    for instance in piped_instances:
+        try:
+            resp = requests.get(f"{instance}/streams/{video_id}", timeout=10)
+            if resp.status_code == 200:
+                subs = resp.json().get("subtitles", [])
+                if subs:
+                    # Prefer English manual, then English auto, then anything
+                    en_subs = [s for s in subs if s.get('code', '').startswith('en')]
+                    target_sub = en_subs[0] if en_subs else subs[0]
+                    
+                    vtt_resp = requests.get(target_sub['url'], timeout=10)
+                    if vtt_resp.status_code == 200:
+                        text = parse_vtt(vtt_resp.text)
+                        if len(text) > 50:
+                            return text
+        except:
+            continue
 
-        # Prioritize English, fallback to the first available language
-        track = next((c for c in captions if c.get("languageCode") == "en"), captions[0])
-        xml_url = track.get("baseUrl")
-        
-        if not xml_url:
-            raise ValueError("Caption URL could not be retrieved.")
+    # 2. Try Invidious API Network Fallback
+    invidious_instances = [
+        "https://vid.puffyan.us",
+        "https://invidious.jing.rocks",
+        "https://yewtu.be"
+    ]
+    
+    for instance in invidious_instances:
+        try:
+            resp = requests.get(f"{instance}/api/v1/captions/{video_id}", timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                captions = data.get("captions", [])
+                if captions:
+                    en_caps = [c for c in captions if c.get('languageCode', '').startswith('en')]
+                    target_cap = en_caps[0] if en_caps else captions[0]
+                    
+                    vtt_resp = requests.get(f"{instance}{target_cap['url']}", timeout=10)
+                    if vtt_resp.status_code == 200:
+                        text = parse_vtt(vtt_resp.text)
+                        if len(text) > 50:
+                            return text
+        except:
+            continue
             
-        xml_resp = requests.get(xml_url, timeout=10)
-        clean_text = re.sub(r'<[^>]+>', ' ', xml_resp.text)
-        clean_text = html.unescape(clean_text)
-        final_text = re.sub(r'\s+', ' ', clean_text).strip()
-        
-        if len(final_text) < 20:
-            raise ValueError("Extracted text was blank or too short.")
-            
-        return final_text
-        
-    except Exception as e:
-        raise ValueError(f"{str(e)}")
+    raise ValueError("Decentralized proxy network failed to extract subtitles. The video may not have captions.")
 
 def clean_web_markdown(text):
     text = re.sub(r'<HTML.*?>.*?</HTML>', '', text, flags=re.IGNORECASE | re.DOTALL)
@@ -316,14 +333,14 @@ def section_generator(api_key):
         elif source_type == "YouTube URL":
             url = st.text_input("Video URL")
             if url:
-                with st.spinner("Bypassing Bot Walls & Transcribing..."):
+                with st.spinner("Bypassing IP Blocks & Extracting..."):
                     try:
                         video_id = extract_youtube_id(url)
                         if not video_id:
                             raise ValueError("Invalid YouTube URL.")
                         
-                        # Use the Internal Google API to guarantee clean extraction
-                        raw_text = get_internal_youtube_transcript(video_id)
+                        # Use the Decentralized Network
+                        raw_text = get_decentralized_transcript(video_id)
                         
                         st.success("Transcript Extracted Successfully!")
                         with st.expander("Preview & Edit Transcript", expanded=True):
