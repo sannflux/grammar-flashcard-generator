@@ -23,7 +23,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 # ====================== 1. SAFE IMPORTS & CONFIGURATION ======================
 st.set_page_config(
-    page_title="Flashcard Library Pro v6.8", 
+    page_title="Flashcard Library Pro v6.9", 
     page_icon="🧠", 
     layout="wide",
     initial_sidebar_state="expanded"
@@ -36,7 +36,6 @@ except ImportError:
     BS4_AVAILABLE = False
 
 try:
-    import youtube_transcript_api
     from youtube_transcript_api import YouTubeTranscriptApi
     YOUTUBE_AVAILABLE = True
 except ImportError:
@@ -157,7 +156,7 @@ def extract_pdf_text(uploaded_file):
         return None, f"Error reading PDF: {str(e)}"
 
 def extract_youtube_id(url):
-    """Robust extraction of the exactly 11-character YouTube video ID."""
+    """Robust regex to grab ONLY the 11-character video ID."""
     match = re.search(r'(?:v=|\/|youtu\.be\/)([0-9A-Za-z_-]{11}).*', url)
     return match.group(1) if match else None
 
@@ -265,41 +264,23 @@ def section_generator(api_key):
                         try:
                             video_id = extract_youtube_id(url)
                             if not video_id:
-                                raise ValueError("Could not extract a valid 11-character YouTube ID from the URL.")
-                            
-                            try:
-                                # Fetch ALL available transcripts for this video
-                                transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-                                
-                                try:
-                                    # Plan A: Look for standard English (manual or auto-generated)
-                                    transcript = transcript_list.find_transcript(['en', 'en-US', 'en-GB'])
-                                except youtube_transcript_api.NoTranscriptFound:
-                                    # Plan B: Grab the very first available transcript (any language)
-                                    transcript = next(iter(transcript_list))
-                                    try:
-                                        # Tell YouTube to translate it to English on the fly!
-                                        transcript = transcript.translate('en')
-                                    except Exception:
-                                        pass # Keep raw language if translation isn't supported
-                                        
-                                # Actually download the text
-                                transcript_data = transcript.fetch()
-                                raw_text = " ".join([t['text'] for t in transcript_data])
-                                
-                                st.success("Transcript Extracted Successfully!")
-                                with st.expander("Preview & Edit Transcript", expanded=True):
-                                    content_text = st.text_area("Edit text before generating:", raw_text, height=200)
+                                raise ValueError("Could not detect a valid 11-character YouTube ID.")
 
-                            # Explicit Error Catching for exact diagnosis
-                            except youtube_transcript_api.TranscriptsDisabled:
-                                st.error("❌ YouTube Error: The creator of this video explicitly disabled closed captions.")
-                            except youtube_transcript_api.NoTranscriptFound:
-                                st.error("❌ YouTube Error: There are zero transcripts available for this video.")
-                            except youtube_transcript_api.CouldNotRetrieveTranscript:
-                                st.error("❌ Network Error: Streamlit Cloud's IP is currently blocked by YouTube. Please run the app locally.")
-                            except youtube_transcript_api.VideoUnavailable:
-                                st.error("❌ YouTube Error: The video is unavailable, private, or age-restricted.")
+                            # Old-school fallback using ONLY get_transcript (Compatible with older pip versions)
+                            # We pass a massive list of fallback languages so it works on almost any video without needing list_transcripts()
+                            fallback_languages = ['en', 'en-US', 'en-GB', 'es', 'fr', 'de', 'it', 'pt', 'ja', 'ko', 'zh-CN', 'ru', 'hi', 'ar', 'nl', 'tr']
+                            
+                            transcript_data = YouTubeTranscriptApi.get_transcript(video_id, languages=fallback_languages)
+                            
+                            if not transcript_data:
+                                raise ValueError("No translatable captions exist for this video.")
+
+                            # Clean the data into a single string
+                            raw_text = " ".join([t['text'] for t in transcript_data])
+                            
+                            st.success("Transcript Extracted Successfully!")
+                            with st.expander("Preview & Edit Transcript", expanded=True):
+                                content_text = st.text_area("Edit text before generating:", raw_text, height=200)
                                 
                         except Exception as e: 
                             st.error(f"❌ Error: {str(e)}")
