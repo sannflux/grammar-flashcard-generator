@@ -240,23 +240,12 @@ def _extract_ytinitialplayerresponse(html_content: str) -> Optional[dict]:
             return None
 
 def _discover_timedtext_tracks(video_id: str, headers: dict, cookies: dict) -> List[dict]:
-    """
-    Plan B: timedtext discovery endpoint.
-    Returns a list of tracks like: [{"lang_code":"en","name":"English","kind":"asr"}, ...]
-    """
-    params = {
-        "v": video_id,
-        "type": "list",
-    }
+    params = {"v": video_id, "type": "list"}
     resp = requests.get("https://www.youtube.com/api/timedtext", params=params, headers=headers, cookies=cookies, timeout=15)
     resp.raise_for_status()
     text = resp.text
-
-    # If no captions, YouTube often returns empty string.
     if not text or "<transcript_list" not in text:
         return []
-
-    # Parse <track ... /> tags
     tracks = []
     for m in re.finditer(r'<track\b([^/>]*)\/?>', text, flags=re.IGNORECASE):
         attrs = m.group(1)
@@ -266,28 +255,64 @@ def _discover_timedtext_tracks(video_id: str, headers: dict, cookies: dict) -> L
         tracks.append({
             "lang_code": lang_code.group(1) if lang_code else None,
             "name": html.unescape(name.group(1)) if name else None,
-            "kind": kind.group(1) if kind else None,  # "asr" for auto
+            "kind": kind.group(1) if kind else None,
         })
     return [t for t in tracks if t.get("lang_code")]
 
 def _fetch_timedtext_xml(video_id: str, lang_code: str, headers: dict, cookies: dict, kind: Optional[str] = None) -> str:
-    params = {
-        "v": video_id,
-        "lang": lang_code,
-        "fmt": "srv3",  # more structured than vtt in many cases
-    }
+    params = {"v": video_id, "lang": lang_code, "fmt": "srv3"}
     if kind:
-        params["kind"] = kind  # "asr" for auto captions
-
+        params["kind"] = kind
     resp = requests.get("https://www.youtube.com/api/timedtext", params=params, headers=headers, cookies=cookies, timeout=15)
     resp.raise_for_status()
     return resp.text
 
+def _get_innertube_player_json(video_id: str, headers: dict, cookies: dict) -> dict:
+    """
+    Plan B2: Use YouTube Innertube player endpoint to retrieve captions when HTML/timedtext list do not expose them.
+    """
+    # This client context is commonly used in unofficial integrations.
+    payload = {
+        "videoId": video_id,
+        "context": {
+            "client": {
+                "clientName": "WEB",
+                "clientVersion": "2.20250301.00.00",
+                "hl": "en",
+                "gl": "US"
+            }
+        }
+    }
+    # This endpoint can work without API key for many cases; if it fails, we fallback further.
+    url = "https://www.youtube.com/youtubei/v1/player?prettyPrint=false"
+    resp = requests.post(url, headers={**headers, "Content-Type": "application/json"}, cookies=cookies, json=payload, timeout=15)
+    resp.raise_for_status()
+    return resp.json()
+
+def _extract_caption_baseurl_from_player(player_json: dict) -> Optional[str]:
+    try:
+        tracks = (
+            player_json.get("captions", {})
+                      .get("playerCaptionsTracklistRenderer", {})
+                      .get("captionTracks", [])
+        )
+        if not tracks:
+            return None
+        # Prefer English if present
+        for t in tracks:
+            lang = (t.get("languageCode") or "").lower()
+            if lang.startswith("en") and t.get("baseUrl"):
+                return t["baseUrl"]
+        return tracks[0].get("baseUrl")
+    except Exception:
+        return None
+
 def get_native_youtube_transcript(video_id: str) -> str:
     """
     Multi-stage native extractor:
-    Plan B: timedtext discovery (works when captionTracks absent in HTML)
-    Plan C: ytInitialPlayerResponse captionTracks (legacy)
+      Plan B: /api/timedtext?type=list discovery
+      Plan B2: Innertube /youtubei/v1/player to obtain captionTracks baseUrl
+      Plan C: watch HTML ytInitialPlayerResponse captionTracks
     """
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -299,7 +324,6 @@ def get_native_youtube_transcript(video_id: str) -> str:
     try:
         tracks = _discover_timedtext_tracks(video_id, headers=headers, cookies=cookies)
         if tracks:
-            # Prefer English manual first (kind None), then English ASR, else first track.
             preferred = None
             for t in tracks:
                 if t["lang_code"].startswith("en") and t.get("kind") is None:
@@ -326,7 +350,20 @@ def get_native_youtube_transcript(video_id: str) -> str:
     except Exception:
         pass
 
-    # -------- Plan C: ytInitialPlayerResponse captionTracks --------
+    # -------- Plan B2: Innertube player endpoint --------
+    try:
+        player_json = _get_innertube_player_json(video_id, headers=headers, cookies=cookies)
+        base_url = _extract_caption_baseurl_from_player(player_json)
+        if base_url:
+            xml_resp = requests.get(base_url, headers=headers, timeout=15)
+            xml_resp.raise_for_status()
+            parsed = _parse_transcript_xml(xml_resp.text)
+            if parsed and len(parsed) > 20:
+                return parsed
+    except Exception:
+        pass
+
+    # -------- Plan C: watch HTML captionTracks --------
     watch_url = f"https://www.youtube.com/watch?v={video_id}"
     html_content = requests.get(watch_url, headers=headers, cookies=cookies, timeout=15).text
     player = _extract_ytinitialplayerresponse(html_content)
@@ -343,7 +380,7 @@ def get_native_youtube_transcript(video_id: str) -> str:
         tracks = []
 
     if not tracks:
-        raise ValueError("No caption tracks found via timedtext or watch HTML. The video may not have captions enabled.")
+        raise ValueError("No caption tracks found. The video may not have captions enabled or is blocked for this environment.")
 
     base_url = tracks[0].get("baseUrl")
     if not base_url:
@@ -351,7 +388,10 @@ def get_native_youtube_transcript(video_id: str) -> str:
 
     xml_resp = requests.get(base_url, headers=headers, timeout=15)
     xml_resp.raise_for_status()
-    return _parse_transcript_xml(xml_resp.text)
+    parsed = _parse_transcript_xml(xml_resp.text)
+    if not parsed or len(parsed) < 20:
+        raise ValueError("Transcript extraction returned empty text.")
+    return parsed
 
 def clean_web_markdown(text):
     text = re.sub(r'<HTML.*?>.*?</HTML>', '', text, flags=re.IGNORECASE | re.DOTALL)
@@ -473,25 +513,29 @@ def section_generator(api_key):
                             raise ValueError("Invalid YouTube URL.")
 
                         raw_text = ""
-                        errors = []
+                        stage_log = []
 
                         # Plan A: youtube-transcript-api
                         if YOUTUBE_AVAILABLE:
                             try:
                                 raw_text = get_youtube_transcript_via_library(video_id)
+                                stage_log.append("Plan A: youtube-transcript-api ✅")
                             except (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable) as e:
-                                errors.append(f"Library: {type(e).__name__}")
+                                stage_log.append(f"Plan A: youtube-transcript-api ❌ ({type(e).__name__})")
                                 raw_text = ""
                             except Exception as e:
-                                errors.append(f"Library: {type(e).__name__}")
+                                stage_log.append(f"Plan A: youtube-transcript-api ❌ ({type(e).__name__})")
                                 raw_text = ""
+                        else:
+                            stage_log.append("Plan A: youtube-transcript-api (not installed)")
 
-                        # Plan B/C: Native extractor (timedtext discovery -> HTML)
+                        # Plan B/B2/C native chain
                         if not raw_text:
                             try:
                                 raw_text = get_native_youtube_transcript(video_id)
+                                stage_log.append("Plan B/B2/C: native extractor ✅")
                             except Exception as e:
-                                errors.append(f"Native: {type(e).__name__}")
+                                stage_log.append(f"Plan B/B2/C: native extractor ❌ ({type(e).__name__})")
                                 raise
 
                         if not raw_text or len(raw_text.strip()) < 20:
@@ -501,9 +545,8 @@ def section_generator(api_key):
                         with st.expander("Preview & Edit Transcript", expanded=True):
                             content_text = st.text_area("Edit text before generating:", raw_text, height=200)
 
-                        if errors:
-                            with st.expander("Debug details", expanded=False):
-                                st.write(errors)
+                        with st.expander("Debug details", expanded=False):
+                            st.write(stage_log)
 
                     except Exception as e:
                         st.error(f"Error extracting transcript: {str(e)}")
