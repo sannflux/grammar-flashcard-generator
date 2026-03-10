@@ -24,7 +24,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 # ====================== 1. SAFE IMPORTS & CONFIGURATION ======================
 st.set_page_config(
-    page_title="Flashcard Library Pro v6.5",
+    page_title="Flashcard Library Pro v6.6",
     page_icon="🧠",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -38,9 +38,18 @@ except ImportError:
 
 YOUTUBE_AVAILABLE = False
 YouTubeTranscriptApi = None
+TranscriptsDisabled = Exception
+NoTranscriptFound = Exception
+VideoUnavailable = Exception
+
 try:
     from youtube_transcript_api import YouTubeTranscriptApi as _YTA
     YouTubeTranscriptApi = _YTA
+    try:
+        from youtube_transcript_api import TranscriptsDisabled as _TD, NoTranscriptFound as _NTF, VideoUnavailable as _VU
+        TranscriptsDisabled, NoTranscriptFound, VideoUnavailable = _TD, _NTF, _VU
+    except Exception:
+        pass
     YOUTUBE_AVAILABLE = True
 except Exception:
     YOUTUBE_AVAILABLE = False
@@ -293,10 +302,7 @@ def parse_uploaded_transcript(uploaded_file) -> Tuple[str, Optional[str]]:
 def get_youtube_transcript_via_library(video_id: str, preferred_langs: Optional[List[str]] = None) -> str:
     if not YOUTUBE_AVAILABLE:
         raise RuntimeError("youtube-transcript-api not installed.")
-
     preferred_langs = preferred_langs or ["en", "en-US", "en-GB"]
-
-    # Most compatible call across versions:
     data = YouTubeTranscriptApi.get_transcript(video_id, languages=preferred_langs)
     return _normalize_transcript_text([x.get("text", "") for x in data])
 
@@ -352,7 +358,6 @@ def get_native_youtube_transcript(video_id: str) -> Tuple[str, List[str]]:
 
 def _external_provider_transcript(video_id: str, stage_log: List[str]) -> str:
     headers = {"User-Agent": "Mozilla/5.0"}
-
     try:
         u = f"https://youtubetranscript.com/?server_vid2={video_id}"
         r = requests.get(u, headers=headers, timeout=15)
@@ -363,42 +368,77 @@ def _external_provider_transcript(video_id: str, stage_log: List[str]) -> str:
                 return parsed
     except Exception as e:
         stage_log.append(f"External1 failed: {type(e).__name__}: {str(e)[:80]}")
-
     return ""
 
+TRANSCRIPT_MIN_CHARS = 800  # guard against useless short transcripts
+
 @st.cache_data(show_spinner=False, ttl=60 * 60)
-def cached_transcript_attempt(video_id: str, allow_external: bool) -> Tuple[str, List[str]]:
+def cached_transcript_attempt(video_id: str, allow_external: bool) -> Tuple[str, List[str], str]:
+    """
+    Returns: (transcript_text, logs, status_code)
+    status_code in:
+      ok, disabled, unavailable, not_found, blocked, too_short, error
+    """
     logs: List[str] = []
     logs.append(f"youtube-transcript-api version: {_get_pkg_version('youtube-transcript-api')}")
 
+    # Plan A
     if YOUTUBE_AVAILABLE:
         try:
             t = get_youtube_transcript_via_library(video_id)
-            if t and len(t) > 20:
+            if t and len(t) >= TRANSCRIPT_MIN_CHARS:
                 logs.append("Plan A succeeded ✅")
-                return t, logs
+                return t, logs, "ok"
+            if t and len(t) < TRANSCRIPT_MIN_CHARS:
+                logs.append(f"Plan A too short ({len(t)} chars) ❌")
+                return t, logs, "too_short"
             logs.append("Plan A returned empty ❌")
+            return "", logs, "not_found"
+        except TranscriptsDisabled as e:
+            logs.append(f"Plan A transcripts disabled ❌ ({str(e)[:200]})")
+            # Don't hard-fail; external providers sometimes still return something
+            status = "disabled"
+        except VideoUnavailable as e:
+            logs.append(f"Plan A video unavailable ❌ ({str(e)[:200]})")
+            status = "unavailable"
+        except NoTranscriptFound as e:
+            logs.append(f"Plan A no transcript found ❌ ({str(e)[:200]})")
+            status = "not_found"
         except Exception as e:
-            logs.append(f"Plan A failed ❌ ({type(e).__name__}: {str(e)})")
+            logs.append(f"Plan A failed ❌ ({type(e).__name__}: {str(e)[:200]})")
+            status = "error"
     else:
         logs.append("Plan A not installed ❌")
+        status = "error"
 
+    # Plan B
     try:
         t, l = get_native_youtube_transcript(video_id)
         logs.append("Plan B succeeded ✅")
         logs.extend([f"Native: {x}" for x in l])
-        return t, logs
+        if t and len(t) >= TRANSCRIPT_MIN_CHARS:
+            return t, logs, "ok"
+        if t:
+            logs.append(f"Plan B too short ({len(t)} chars) ❌")
+            return t, logs, "too_short"
     except Exception as e:
-        logs.append(f"Plan B failed ❌ ({type(e).__name__}: {str(e)})")
+        logs.append(f"Plan B failed ❌ ({type(e).__name__}: {str(e)[:200]})")
+        # likely blocked in hosted env
+        if status == "error":
+            status = "blocked"
 
+    # Plan C
     if allow_external:
         t = _external_provider_transcript(video_id, logs)
-        if t and len(t) > 20:
+        if t and len(t) >= TRANSCRIPT_MIN_CHARS:
             logs.append("Plan C succeeded ✅")
-            return t, logs
+            return t, logs, "ok"
+        if t and len(t) < TRANSCRIPT_MIN_CHARS:
+            logs.append(f"Plan C too short ({len(t)} chars) ❌")
+            return t, logs, "too_short"
         logs.append("Plan C failed/empty ❌")
 
-    return "", logs
+    return "", logs, status
 
 def clean_web_markdown(text):
     text = re.sub(r'<HTML.*?>.*?</HTML>', '', text, flags=re.IGNORECASE | re.DOTALL)
@@ -470,6 +510,7 @@ def inject_custom_css():
         .card-tag { background: var(--primary-color); color: #ffffff; padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: 600; text-transform: uppercase; margin-bottom: 15px; }
         .smallhelp { font-size: 13px; opacity: 0.8; }
         .warnbox { padding: 10px 12px; border-radius: 10px; border: 1px solid rgba(255,165,0,0.4); background: rgba(255,165,0,0.08); }
+        code { font-size: 12px; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -515,6 +556,7 @@ def section_generator(api_key):
         elif source_type == "YouTube URL":
             url = st.text_input("Video URL")
             allow_external = st.toggle("Allow external transcript fallback (recommended on Streamlit Cloud)", value=True)
+            show_debug = st.toggle("Show transcript debug logs", value=False)
 
             video_id = extract_youtube_id(url) if url else None
             if url and not video_id:
@@ -523,24 +565,76 @@ def section_generator(api_key):
             if video_id:
                 st.caption(f"Video ID: {video_id}")
 
+                # Auto-attempt on paste (once per new video_id)
                 if st.session_state.get("yt_last_video_id") != video_id:
                     st.session_state["yt_last_video_id"] = video_id
                     st.session_state["yt_last_error"] = ""
+
                     with st.spinner("Auto-fetching transcript..."):
-                        t, logs = cached_transcript_attempt(video_id, allow_external=allow_external)
-                        if t and len(t.strip()) > 20:
+                        t, logs, status = cached_transcript_attempt(video_id, allow_external=allow_external)
+                        if t and len(t.strip()) >= TRANSCRIPT_MIN_CHARS:
                             st.session_state["yt_assist_text"] = t
                         else:
-                            st.session_state["yt_last_error"] = "Auto transcript fetch failed on this host/IP."
+                            # message based on status
+                            if status == "disabled":
+                                st.session_state["yt_last_error"] = (
+                                    "This video appears to have captions/transcripts disabled. "
+                                    "Automatic transcript extraction may be impossible. Try another video or paste/upload transcript."
+                                )
+                            elif status == "unavailable":
+                                st.session_state["yt_last_error"] = "Video unavailable. Check link/region restrictions."
+                            elif status == "blocked":
+                                st.session_state["yt_last_error"] = (
+                                    "YouTube transcript endpoints are blocked from this host (common on Streamlit Cloud). "
+                                    "External fallback may help; otherwise paste/upload transcript."
+                                )
+                            elif status == "too_short":
+                                st.session_state["yt_last_error"] = (
+                                    f"Transcript fetched but looks too short ({len(t)} chars). "
+                                    "This often means the source returned incomplete captions. Try another video or paste/upload transcript."
+                                )
+                            else:
+                                st.session_state["yt_last_error"] = "Auto transcript fetch failed. Try another video or paste/upload transcript."
 
-                    with st.expander("Debug details", expanded=False):
-                        st.write(logs)
+                    if show_debug:
+                        with st.expander("Debug details", expanded=False):
+                            st.write(logs)
 
+                if st.button("🔁 Retry auto-fetch transcript", use_container_width=True):
+                    with st.spinner("Retrying..."):
+                        t, logs, status = cached_transcript_attempt(video_id, allow_external=allow_external)
+                        if t and len(t.strip()) >= TRANSCRIPT_MIN_CHARS:
+                            st.session_state["yt_assist_text"] = t
+                            st.session_state["yt_last_error"] = ""
+                            st.success("Transcript fetched.")
+                        else:
+                            st.warning("Retry failed. Use Assist Mode below.")
+                        if show_debug:
+                            with st.expander("Debug details", expanded=False):
+                                st.write(logs)
+
+                # Assist Mode callout
                 if st.session_state.get("yt_last_error"):
                     st.markdown(
-                        f"<div class='warnbox'><b>Auto-fetch status</b><br/>{html.escape(st.session_state['yt_last_error'])}</div>",
+                        "<div class='warnbox'><b>YouTube Assist Mode</b><br/>"
+                        + html.escape(st.session_state["yt_last_error"]) +
+                        "<br/><span class='smallhelp'>Tip: choose videos with CC enabled for best results.</span></div>",
                         unsafe_allow_html=True
                     )
+
+                # Upload transcript (reliable)
+                up = st.file_uploader(
+                    "Upload transcript file (.txt .vtt .srt .json .xml)",
+                    type=["txt", "vtt", "srt", "json", "xml"],
+                    key="yt_transcript_upload"
+                )
+                if up is not None:
+                    parsed, err = parse_uploaded_transcript(up)
+                    if err:
+                        st.error(err)
+                    else:
+                        st.session_state["yt_assist_text"] = parsed
+                        st.success("Transcript file parsed and loaded.")
 
                 with st.expander("Transcript (auto-filled when possible)", expanded=True):
                     st.session_state["yt_assist_text"] = st.text_area(
@@ -575,8 +669,8 @@ def section_generator(api_key):
             if not (content_text or image_content):
                 st.warning("No valid content")
                 return
-            if source_type == "YouTube URL" and (not content_text or len(content_text.strip()) < 50):
-                st.warning("Transcript is empty/too short. Auto-fetch may be blocked; upload/paste transcript.")
+            if source_type == "YouTube URL" and (not content_text or len(content_text.strip()) < TRANSCRIPT_MIN_CHARS):
+                st.warning("Transcript is empty/too short. Use upload/paste transcript (Assist Mode) or try a video with CC enabled.")
                 return
 
             with st.spinner("Gemini is thinking..."):
@@ -605,6 +699,34 @@ def section_generator(api_key):
                         st.warning("No cards returned, or Deck Name is missing.")
                 except Exception as e:
                     st.error(f"Failed: {e}")
+
+    with st.expander("✍️ Create Flashcard Manually"):
+        with st.form("manual_card", clear_on_submit=True):
+            with get_db_connection() as conn:
+                existing_decks = [d['name'] for d in conn.execute("SELECT name FROM decks").fetchall()]
+            m_deck = st.selectbox("Select Deck", existing_decks) if existing_decks else st.text_input("New Deck Name")
+            m_front = st.text_area("Front (Question)")
+            m_back = st.text_area("Back (Answer)")
+            m_exp = st.text_input("Explanation (Optional)")
+            m_tag = st.text_input("Tag", "Manual")
+
+            if st.form_submit_button("Save Card"):
+                if m_deck and m_front and m_back:
+                    with get_db_connection() as conn:
+                        c = conn.cursor()
+                        c.execute(
+                            "INSERT OR IGNORE INTO decks (name, created_at) VALUES (?, ?)",
+                            (m_deck, datetime.now().strftime("%Y-%m-%d"))
+                        )
+                        d_id = c.execute("SELECT id FROM decks WHERE name=?", (m_deck,)).fetchone()[0]
+                        c.execute(
+                            "INSERT INTO cards (deck_id, front, back, explanation, tag) VALUES (?, ?, ?, ?, ?)",
+                            (d_id, m_front, m_back, m_exp, m_tag)
+                        )
+                        conn.commit()
+                    st.success("Card added!")
+                else:
+                    st.error("Missing fields")
 
 def cb_show_answer():
     st.session_state["show_answer"] = True
