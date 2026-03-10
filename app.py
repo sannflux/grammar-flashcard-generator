@@ -206,22 +206,31 @@ def fetch_transcript_via_worker(worker_base_url: str, video_id: str, debug: bool
     url = f"{worker_base_url}/transcript?video_id={video_id}&lang=en"
     if debug:
         url += "&debug=1"
+
     logs.append(f"GET {url}")
 
     try:
         r = requests.get(url, timeout=25)
         logs.append(f"status={r.status_code} len={len(r.text)}")
         if not r.ok:
-            return "", logs + [f"http_error={r.status_code} body_head={r.text[:200]}"]
+            return "", logs + [f"http_error={r.status_code} body_head={r.text[:400]}"]
+
         data = r.json()
+
+        # Pull worker-side logs if present
+        worker_logs = data.get("logs")
+        if debug and worker_logs:
+            logs.append(f"worker_logs={worker_logs}")
+
         if not data.get("ok"):
             return "", logs + [f"ok=false error={data.get('error')} detail={data.get('detail')}"]
-        if debug and data.get("logs"):
-            logs.append(f"worker_logs={data.get('logs')}")
+
         text = _normalize_transcript_text(data.get("text", ""))
         logs.append(f"transcript_chars={len(text)} lang={data.get('lang')} kind={data.get('kind')}")
+
         if len(text) < TRANSCRIPT_MIN_CHARS:
-            return "", logs + [f"too_short={len(text)}"]
+            return "", logs + [f"too_short={len(text)} text_head={text[:120]}"]
+
         return text, logs
     except Exception as e:
         return "", logs + [f"exception={type(e).__name__}: {str(e)[:200]}"]
