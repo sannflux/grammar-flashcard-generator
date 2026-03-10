@@ -24,7 +24,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 # ====================== 1. SAFE IMPORTS & CONFIGURATION ======================
 st.set_page_config(
-    page_title="Flashcard Library Pro v6.7",
+    page_title="Flashcard Library Pro v7.0",
     page_icon="🧠",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -35,35 +35,6 @@ try:
     BS4_AVAILABLE = True
 except ImportError:
     BS4_AVAILABLE = False
-
-YOUTUBE_AVAILABLE = False
-YouTubeTranscriptApi = None
-TranscriptsDisabled = Exception
-NoTranscriptFound = Exception
-VideoUnavailable = Exception
-
-try:
-    from youtube_transcript_api import YouTubeTranscriptApi as _YTA
-    YouTubeTranscriptApi = _YTA
-    try:
-        from youtube_transcript_api import TranscriptsDisabled as _TD, NoTranscriptFound as _NTF, VideoUnavailable as _VU
-        TranscriptsDisabled, NoTranscriptFound, VideoUnavailable = _TD, _NTF, _VU
-    except Exception:
-        pass
-    YOUTUBE_AVAILABLE = True
-except Exception:
-    YOUTUBE_AVAILABLE = False
-
-def _get_pkg_version(pkg: str) -> str:
-    try:
-        import importlib.metadata as md
-        return md.version(pkg)
-    except Exception:
-        try:
-            import pkg_resources
-            return pkg_resources.get_distribution(pkg).version
-        except Exception:
-            return "unknown"
 
 try:
     from pypdf import PdfReader
@@ -201,306 +172,40 @@ def extract_youtube_id(url):
     match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11}).*', url)
     return match.group(1) if match else None
 
-def _normalize_transcript_text(chunks: List[str]) -> str:
-    text = " ".join([c.strip() for c in chunks if c and c.strip()])
+def _normalize_transcript_text(text: str) -> str:
+    if not text:
+        return ""
     text = html.unescape(text)
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
-def _parse_transcript_xml(xml_text: str) -> str:
-    bodies = re.findall(r'<text[^>]*>(.*?)</text>', xml_text, flags=re.DOTALL | re.IGNORECASE)
-    bodies = [html.unescape(b) for b in bodies]
-    bodies = [re.sub(r'<[^>]+>', ' ', b) for b in bodies]
-    return _normalize_transcript_text(bodies)
-
-def _parse_transcript_json3(json_text: str) -> str:
-    try:
-        obj = json.loads(json_text)
-    except Exception:
-        return ""
-    chunks = []
-    for ev in obj.get("events", []) or []:
-        for seg in ev.get("segs", []) or []:
-            t = seg.get("utf8")
-            if t:
-                chunks.append(t)
-    return _normalize_transcript_text(chunks)
-
-def _parse_transcript_vtt(vtt_text: str) -> str:
-    lines = vtt_text.splitlines()
-    out = []
-    for ln in lines:
-        s = ln.strip()
-        if not s:
-            continue
-        if s.upper().startswith("WEBVTT"):
-            continue
-        if re.match(r'^\d{2}:\d{2}:\d{2}\.\d{3}\s+-->\s+\d{2}:\d{2}:\d{2}\.\d{3}', s):
-            continue
-        if re.match(r'^\d{2}:\d{2}\.\d{3}\s+-->\s+\d{2}:\d{2}\.\d{3}', s):
-            continue
-        s = re.sub(r'<[^>]+>', '', s)
-        out.append(s)
-    return _normalize_transcript_text(out)
-
-def _parse_transcript_srt(srt_text: str) -> str:
-    lines = srt_text.splitlines()
-    out = []
-    for ln in lines:
-        s = ln.strip()
-        if not s:
-            continue
-        if re.match(r'^\d+$', s):
-            continue
-        if re.match(r'^\d{2}:\d{2}:\d{2},\d{3}\s+-->\s+\d{2}:\d{2}:\d{2},\d{3}', s):
-            continue
-        s = re.sub(r'<[^>]+>', '', s)
-        out.append(s)
-    return _normalize_transcript_text(out)
-
-def _parse_transcript_auto(text: str) -> str:
-    if not text:
-        return ""
-    t = text.lstrip()
-
-    if t.startswith("{") or t.startswith("["):
-        parsed = _parse_transcript_json3(text)
-        if parsed:
-            return parsed
-
-    if "WEBVTT" in t[:80].upper():
-        parsed = _parse_transcript_vtt(text)
-        if parsed:
-            return parsed
-
-    if re.search(r'\d{2}:\d{2}:\d{2},\d{3}\s+-->\s+\d{2}:\d{2}:\d{2},\d{3}', text):
-        parsed = _parse_transcript_srt(text)
-        if parsed:
-            return parsed
-
-    if "<text" in text and "</text>" in text:
-        parsed = _parse_transcript_xml(text)
-        if parsed:
-            return parsed
-
-    if len(text.strip()) > 20 and "<html" not in text.lower():
-        return _normalize_transcript_text([text])
-
-    return ""
-
-def parse_uploaded_transcript(uploaded_file) -> Tuple[str, Optional[str]]:
-    try:
-        raw_bytes = uploaded_file.getvalue()
-        raw = raw_bytes.decode("utf-8", errors="ignore")
-        parsed = _parse_transcript_auto(raw)
-        if not parsed or len(parsed.strip()) < 20:
-            return "", "Could not parse transcript file (supported: .txt .vtt .srt .json .xml)."
-        return parsed[:25000], None
-    except Exception as e:
-        return "", f"Error reading transcript file: {e}"
-
-def get_youtube_transcript_via_library(video_id: str, preferred_langs: Optional[List[str]] = None) -> str:
-    if not YOUTUBE_AVAILABLE:
-        raise RuntimeError("youtube-transcript-api not installed.")
-    preferred_langs = preferred_langs or ["en", "en-US", "en-GB"]
-    data = YouTubeTranscriptApi.get_transcript(video_id, languages=preferred_langs)
-    return _normalize_transcript_text([x.get("text", "") for x in data])
-
-def get_native_youtube_transcript(video_id: str) -> Tuple[str, List[str]]:
-    stage_log = []
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-    cookies = {"CONSENT": "YES+cb.20210328-17-p0.en+FX+478"}
-
-    try:
-        params = {"v": video_id, "type": "list"}
-        r = requests.get("https://www.youtube.com/api/timedtext", params=params, headers=headers, cookies=cookies, timeout=15)
-        stage_log.append(f"Timedtext list status={r.status_code} len={len(r.text)}")
-        if r.ok and "<transcript_list" in r.text:
-            tracks = []
-            for m in re.finditer(r'<track\b([^/>]*)\/?>', r.text, flags=re.IGNORECASE):
-                attrs = m.group(1)
-                lang_code = re.search(r'lang_code="([^"]+)"', attrs)
-                kind = re.search(r'kind="([^"]+)"', attrs)
-                if lang_code:
-                    tracks.append({"lang_code": lang_code.group(1), "kind": kind.group(1) if kind else None})
-            stage_log.append(f"Timedtext list tracks={len(tracks)}")
-            if tracks:
-                chosen = None
-                for t in tracks:
-                    if t["lang_code"].startswith("en") and t.get("kind") is None:
-                        chosen = t
-                        break
-                if chosen is None:
-                    for t in tracks:
-                        if t["lang_code"].startswith("en"):
-                            chosen = t
-                            break
-                if chosen is None:
-                    chosen = tracks[0]
-
-                params2 = {"v": video_id, "lang": chosen["lang_code"], "fmt": "json3"}
-                if chosen.get("kind"):
-                    params2["kind"] = chosen["kind"]
-                r2 = requests.get("https://www.youtube.com/api/timedtext", params=params2, headers=headers, cookies=cookies, timeout=15)
-                stage_log.append(f"Timedtext json3 status={r2.status_code} len={len(r2.text)} head='{r2.text[:80].replace(chr(10),' ')}'")
-                if r2.ok:
-                    parsed = _parse_transcript_auto(r2.text)
-                    stage_log.append(f"Timedtext parsed_len={len(parsed)}")
-                    if parsed and len(parsed) > 20:
-                        return parsed, stage_log
-    except Exception as e:
-        stage_log.append(f"Timedtext failed: {type(e).__name__}: {str(e)[:120]}")
-
-    raise ValueError("Native YouTube extraction blocked or unavailable in this environment.")
-
-def _http_get_text(url: str, stage_log: List[str], label: str, timeout: int = 15) -> str:
-    headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        r = requests.get(url, headers=headers, timeout=timeout)
-        stage_log.append(f"{label} status={r.status_code} len={len(r.text)}")
-        if r.ok:
-            return r.text or ""
-    except Exception as e:
-        stage_log.append(f"{label} failed: {type(e).__name__}: {str(e)[:80]}")
-    return ""
-
-def _external_provider_transcript(video_id: str, stage_log: List[str]) -> str:
-    """
-    Try multiple providers. Return best transcript (longest) if any.
-    """
-    best = ""
-
-    # Provider A: youtubetranscript.com
-    txt = _http_get_text(f"https://youtubetranscript.com/?server_vid2={video_id}", stage_log, "External-A")
-    parsed = _parse_transcript_auto(txt)
-    if len(parsed) > len(best):
-        best = parsed
-
-    # Provider A2: via jina-ai mirror (sometimes bypasses WAF)
-    txt = _http_get_text(f"https://r.jina.ai/https://youtubetranscript.com/?server_vid2={video_id}", stage_log, "External-A2")
-    parsed = _parse_transcript_auto(txt)
-    if len(parsed) > len(best):
-        best = parsed
-
-    # Provider B: Invidious caption API (try multiple instances)
-    invidious_instances = [
-        "https://yewtu.be",
-        "https://invidious.fdn.fr",
-        "https://invidious.nerdvpn.de",
-        "https://invidious.protokolla.fi",
-        "https://inv.nadeko.net",
-    ]
-
-    headers = {"User-Agent": "Mozilla/5.0"}
-    for base in invidious_instances:
-        try:
-            u = f"{base}/api/v1/captions/{video_id}"
-            r = requests.get(u, headers=headers, timeout=15)
-            stage_log.append(f"External-B {base} status={r.status_code} len={len(r.text)}")
-            if not r.ok:
-                continue
-            # usually JSON list of tracks
-            data = None
-            try:
-                data = r.json()
-            except Exception:
-                data = None
-            if isinstance(data, list) and data:
-                # choose English track first
-                track = None
-                for t in data:
-                    if (t.get("languageCode") or "").lower().startswith("en") or (t.get("label") or "").lower().startswith("english"):
-                        track = t
-                        break
-                if track is None:
-                    track = data[0]
-                cap_url = track.get("url")
-                if cap_url:
-                    if cap_url.startswith("/"):
-                        cap_url = base + cap_url
-                    rr = requests.get(cap_url, headers=headers, timeout=15)
-                    stage_log.append(f"External-B cap_fetch {base} status={rr.status_code} len={len(rr.text)}")
-                    if rr.ok:
-                        parsed = _parse_transcript_auto(rr.text)
-                        if len(parsed) > len(best):
-                            best = parsed
-            else:
-                # sometimes returns caption directly
-                parsed = _parse_transcript_auto(r.text)
-                if len(parsed) > len(best):
-                    best = parsed
-        except Exception as e:
-            stage_log.append(f"External-B {base} failed: {type(e).__name__}: {str(e)[:80]}")
-
-    return best
-
-TRANSCRIPT_MIN_CHARS = 400  # lowered: many legit short videos/transcripts are <800
+TRANSCRIPT_MIN_CHARS = 200
 
 @st.cache_data(show_spinner=False, ttl=60 * 60)
-def cached_transcript_attempt(video_id: str, allow_external: bool) -> Tuple[str, List[str], str]:
+def fetch_transcript_via_worker(worker_base_url: str, video_id: str) -> Tuple[str, List[str]]:
     logs: List[str] = []
-    logs.append(f"youtube-transcript-api version: {_get_pkg_version('youtube-transcript-api')}")
+    if not worker_base_url:
+        return "", ["Worker URL missing"]
+    worker_base_url = worker_base_url.strip().rstrip("/")
 
-    status = "error"
+    url = f"{worker_base_url}/transcript?video_id={video_id}&lang=en"
+    logs.append(f"GET {url}")
 
-    # Plan A
-    if YOUTUBE_AVAILABLE:
-        try:
-            t = get_youtube_transcript_via_library(video_id)
-            if t and len(t) >= TRANSCRIPT_MIN_CHARS:
-                logs.append(f"Plan A succeeded ✅ ({len(t)} chars)")
-                return t, logs, "ok"
-            if t:
-                logs.append(f"Plan A too short ({len(t)} chars) ❌")
-                status = "too_short"
-            else:
-                logs.append("Plan A empty ❌")
-                status = "not_found"
-        except TranscriptsDisabled as e:
-            logs.append(f"Plan A transcripts disabled ❌ ({str(e)[:200]})")
-            status = "disabled"
-        except VideoUnavailable as e:
-            logs.append(f"Plan A video unavailable ❌ ({str(e)[:200]})")
-            status = "unavailable"
-        except NoTranscriptFound as e:
-            logs.append(f"Plan A no transcript found ❌ ({str(e)[:200]})")
-            status = "not_found"
-        except Exception as e:
-            # ParseError / empty response / consent page usually means blocked on this host
-            logs.append(f"Plan A failed ❌ ({type(e).__name__}: {str(e)[:200]})")
-            status = "blocked"
-    else:
-        logs.append("Plan A not installed ❌")
-        status = "error"
-
-    # Plan B
     try:
-        t, l = get_native_youtube_transcript(video_id)
-        logs.append("Plan B succeeded ✅")
-        logs.extend([f"Native: {x}" for x in l])
-        if t and len(t) >= TRANSCRIPT_MIN_CHARS:
-            return t, logs, "ok"
-        if t:
-            logs.append(f"Plan B too short ({len(t)} chars) ❌")
-            status = "too_short"
+        r = requests.get(url, timeout=25)
+        logs.append(f"status={r.status_code} len={len(r.text)}")
+        if not r.ok:
+            return "", logs + [f"http_error={r.status_code} body_head={r.text[:120]}"]
+        data = r.json()
+        if not data.get("ok"):
+            return "", logs + [f"ok=false error={data.get('error')} detail={data.get('detail')}"]
+        text = _normalize_transcript_text(data.get("text", ""))
+        logs.append(f"transcript_chars={len(text)} lang={data.get('lang')} kind={data.get('kind')}")
+        if len(text) < TRANSCRIPT_MIN_CHARS:
+            return "", logs + [f"too_short={len(text)}"]
+        return text, logs
     except Exception as e:
-        logs.append(f"Plan B failed ❌ ({type(e).__name__}: {str(e)[:200]})")
-
-    # Plan C
-    if allow_external:
-        t = _external_provider_transcript(video_id, logs)
-        if t and len(t) >= TRANSCRIPT_MIN_CHARS:
-            logs.append(f"Plan C succeeded ✅ ({len(t)} chars)")
-            return t, logs, "ok"
-        if t:
-            logs.append(f"Plan C too short ({len(t)} chars) ❌")
-            return t, logs, "too_short"
-        logs.append("Plan C failed/empty ❌")
-
-    return "", logs, status
+        return "", logs + [f"exception={type(e).__name__}: {str(e)[:200]}"]
 
 def clean_web_markdown(text):
     text = re.sub(r'<HTML.*?>.*?</HTML>', '', text, flags=re.IGNORECASE | re.DOTALL)
@@ -572,26 +277,12 @@ def inject_custom_css():
         .card-tag { background: var(--primary-color); color: #ffffff; padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: 600; text-transform: uppercase; margin-bottom: 15px; }
         .smallhelp { font-size: 13px; opacity: 0.8; }
         .warnbox { padding: 10px 12px; border-radius: 10px; border: 1px solid rgba(255,165,0,0.4); background: rgba(255,165,0,0.08); }
+        code { font-size: 12px; }
     </style>
     """, unsafe_allow_html=True)
 
-def _yt_status_message(status: str) -> str:
-    if status == "ok":
-        return "Transcript loaded."
-    if status == "disabled":
-        return "Captions/transcripts are disabled for this video. Choose a video with CC enabled or paste/upload a transcript."
-    if status == "unavailable":
-        return "Video unavailable (region/restriction/link issue)."
-    if status == "blocked":
-        return "YouTube transcript endpoints appear blocked from this host (common on Streamlit Cloud). External fallback will be tried."
-    if status == "too_short":
-        return "Transcript source returned something too short/incomplete. Try a different video or paste/upload transcript."
-    if status == "not_found":
-        return "No transcript found. Try a different video or paste/upload transcript."
-    return "Auto transcript fetch failed. Try another video or paste/upload transcript."
-
 # ====================== 6. APPLICATION SECTIONS ======================
-def section_generator(api_key):
+def section_generator(api_key: str, worker_base_url: str):
     st.header("🏭 Flashcard Factory")
 
     col_input, col_sets = st.columns([2, 1])
@@ -631,74 +322,61 @@ def section_generator(api_key):
 
         elif source_type == "YouTube URL":
             url = st.text_input("Video URL")
-            allow_external = st.toggle("Allow external transcript fallback (recommended on Streamlit Cloud)", value=True)
             show_debug = st.toggle("Show transcript debug logs", value=False)
 
-            video_id = extract_youtube_id(url) if url else None
-            if url and not video_id:
-                st.error("Invalid YouTube URL (couldn't detect video ID).")
+            if url:
+                video_id = extract_youtube_id(url)
+                if not video_id:
+                    st.error("Invalid YouTube URL (couldn't detect video ID).")
+                else:
+                    st.caption(f"Video ID: {video_id}")
 
-            if video_id:
-                st.caption(f"Video ID: {video_id}")
+                    if st.session_state.get("yt_last_video_id") != video_id:
+                        st.session_state["yt_last_video_id"] = video_id
+                        st.session_state["yt_last_error"] = ""
 
-                if st.session_state.get("yt_last_video_id") != video_id:
-                    st.session_state["yt_last_video_id"] = video_id
-                    st.session_state["yt_last_error"] = ""
-
-                    with st.spinner("Auto-fetching transcript..."):
-                        t, logs, status = cached_transcript_attempt(video_id, allow_external=allow_external)
-                        if t and len(t.strip()) >= TRANSCRIPT_MIN_CHARS:
-                            st.session_state["yt_assist_text"] = t
-                            st.session_state["yt_last_error"] = ""
-                        else:
-                            st.session_state["yt_last_error"] = _yt_status_message(status)
-
-                    if show_debug:
-                        with st.expander("Debug details", expanded=False):
-                            st.write(logs)
-
-                if st.button("🔁 Retry auto-fetch transcript", use_container_width=True):
-                    with st.spinner("Retrying..."):
-                        t, logs, status = cached_transcript_attempt(video_id, allow_external=allow_external)
-                        if t and len(t.strip()) >= TRANSCRIPT_MIN_CHARS:
-                            st.session_state["yt_assist_text"] = t
-                            st.session_state["yt_last_error"] = ""
-                            st.success("Transcript fetched.")
-                        else:
-                            st.session_state["yt_last_error"] = _yt_status_message(status)
-                            st.warning(st.session_state["yt_last_error"])
+                        with st.spinner("Fetching transcript (via Worker)..."):
+                            t, logs = fetch_transcript_via_worker(worker_base_url, video_id)
+                            if t:
+                                st.session_state["yt_assist_text"] = t
+                            else:
+                                st.session_state["yt_last_error"] = (
+                                    "Auto transcript failed. The video may have no captions or YouTube blocked the request. "
+                                    "You can still upload/paste transcript below."
+                                )
                         if show_debug:
                             with st.expander("Debug details", expanded=False):
                                 st.write(logs)
 
-                if st.session_state.get("yt_last_error"):
-                    st.markdown(
-                        "<div class='warnbox'><b>YouTube Assist Mode</b><br/>"
-                        + html.escape(st.session_state["yt_last_error"]) +
-                        "<br/><span class='smallhelp'>Tip: videos with CC enabled are the most reliable.</span></div>",
-                        unsafe_allow_html=True
-                    )
+                    if st.button("🔁 Retry transcript fetch", use_container_width=True):
+                        with st.spinner("Retrying (via Worker)..."):
+                            t, logs = fetch_transcript_via_worker(worker_base_url, video_id)
+                            if t:
+                                st.session_state["yt_assist_text"] = t
+                                st.session_state["yt_last_error"] = ""
+                                st.success("Transcript fetched.")
+                            else:
+                                st.session_state["yt_last_error"] = "Retry failed. Upload/paste transcript below."
+                                st.warning(st.session_state["yt_last_error"])
+                            if show_debug:
+                                with st.expander("Debug details", expanded=False):
+                                    st.write(logs)
 
-                up = st.file_uploader(
-                    "Upload transcript file (.txt .vtt .srt .json .xml)",
-                    type=["txt", "vtt", "srt", "json", "xml"],
-                    key="yt_transcript_upload"
-                )
-                if up is not None:
-                    parsed, err = parse_uploaded_transcript(up)
-                    if err:
-                        st.error(err)
-                    else:
-                        st.session_state["yt_assist_text"] = parsed
-                        st.success("Transcript file parsed and loaded.")
+                    if st.session_state.get("yt_last_error"):
+                        st.markdown(
+                            "<div class='warnbox'><b>YouTube Assist Mode</b><br/>"
+                            + html.escape(st.session_state["yt_last_error"]) +
+                            "</div>",
+                            unsafe_allow_html=True
+                        )
 
-                with st.expander("Transcript (auto-filled when possible)", expanded=True):
-                    st.session_state["yt_assist_text"] = st.text_area(
-                        "Transcript:",
-                        value=st.session_state.get("yt_assist_text", ""),
-                        height=240
-                    )
-                    content_text = st.session_state["yt_assist_text"]
+                    with st.expander("Transcript (auto-filled when possible)", expanded=True):
+                        content_text = st.text_area(
+                            "Transcript:",
+                            value=st.session_state.get("yt_assist_text", ""),
+                            height=240
+                        )
+                        st.session_state["yt_assist_text"] = content_text
 
         elif source_type == "Web Article":
             url = st.text_input("Article URL")
@@ -726,7 +404,7 @@ def section_generator(api_key):
                 st.warning("No valid content")
                 return
             if source_type == "YouTube URL" and (not content_text or len(content_text.strip()) < TRANSCRIPT_MIN_CHARS):
-                st.warning("Transcript is empty/too short. Use upload/paste transcript or choose a video with CC enabled.")
+                st.warning("Transcript is empty/too short. Try another video or paste/upload transcript.")
                 return
 
             with st.spinner("Gemini is thinking..."):
@@ -755,34 +433,6 @@ def section_generator(api_key):
                         st.warning("No cards returned, or Deck Name is missing.")
                 except Exception as e:
                     st.error(f"Failed: {e}")
-
-    with st.expander("✍️ Create Flashcard Manually"):
-        with st.form("manual_card", clear_on_submit=True):
-            with get_db_connection() as conn:
-                existing_decks = [d['name'] for d in conn.execute("SELECT name FROM decks").fetchall()]
-            m_deck = st.selectbox("Select Deck", existing_decks) if existing_decks else st.text_input("New Deck Name")
-            m_front = st.text_area("Front (Question)")
-            m_back = st.text_area("Back (Answer)")
-            m_exp = st.text_input("Explanation (Optional)")
-            m_tag = st.text_input("Tag", "Manual")
-
-            if st.form_submit_button("Save Card"):
-                if m_deck and m_front and m_back:
-                    with get_db_connection() as conn:
-                        c = conn.cursor()
-                        c.execute(
-                            "INSERT OR IGNORE INTO decks (name, created_at) VALUES (?, ?)",
-                            (m_deck, datetime.now().strftime("%Y-%m-%d"))
-                        )
-                        d_id = c.execute("SELECT id FROM decks WHERE name=?", (m_deck,)).fetchone()[0]
-                        c.execute(
-                            "INSERT INTO cards (deck_id, front, back, explanation, tag) VALUES (?, ?, ?, ?, ?)",
-                            (d_id, m_front, m_back, m_exp, m_tag)
-                        )
-                        conn.commit()
-                    st.success("Card added!")
-                else:
-                    st.error("Missing fields")
 
 def cb_show_answer():
     st.session_state["show_answer"] = True
@@ -966,12 +616,17 @@ def main():
     with st.sidebar:
         st.title("🧠 Flashcard Pro")
         api_key = st.text_input("Gemini API Key", type="password")
+        worker_base_url = st.text_input(
+            "Transcript Worker Base URL",
+            placeholder="https://yt-transcript-proxy.YOURNAME.workers.dev",
+            help="Deploy the Cloudflare Worker and paste its base URL here (no /transcript)."
+        )
         st.metric("Cards Due Today", get_due_cards_count())
         st.divider()
         page = st.radio("Navigation", ["Study Mode", "Generator", "Library & Stats"], label_visibility="collapsed")
 
     if page == "Generator":
-        section_generator(api_key)
+        section_generator(api_key, worker_base_url)
     elif page == "Study Mode":
         section_study()
     elif page == "Library & Stats":
