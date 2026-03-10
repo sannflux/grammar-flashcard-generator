@@ -1,11 +1,12 @@
-streamlit>=1.30.0
+streamlit
 pandas
 altair
+requests
+beautifulsoup4
+youtube-transcript-api
+pypdf
 google-genai
 pydantic
-beautifulsoup4
-youtube-transcript-api>=0.6.2
-pypdf
 Pillow
 gTTS
 tenacity
