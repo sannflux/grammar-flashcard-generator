@@ -11,21 +11,23 @@ import io
 import base64
 import os
 import html
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta- Deploy full corrected script with professional explanation and requirements.txt.
+
+
 import altair as alt
 import tempfile
 import random
 
 from google import genai
 from google.genai import types
-from pydantic import BaseModel, Field
+from pydantic import Base- Ensure no internal notes or smart quotes remain in final code output.
+
+Model, Field
 from typing import List, Optional
 from PIL import Image
 
 from gtts import gTTS
-from tenacity- Assemble Harper’s YouTube function and Benjamin’s structure into final script, ensuring all fixes are integrated.
-
- import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 import yt_dlp
 from youtube_transcript_api import YouTubeTranscriptApi
@@ -443,7 +445,8 @@ def section_generator(api_key):
                         try:
                             raw_text, metadata = get_youtube_metadata_and_transcript(url)
                             st.success(f"✅ Extracted: **{metadata['title']}**")
-                            st.image(metadata['thumbnail'], width=300) if metadata['thumbnail'] else None
+                            if metadata['thumbnail']:
+                                st.image(metadata['thumbnail'], width=300)
                             suggested_deck = metadata['title'][:60]
                             with st.expander("Preview & Edit Transcript", expanded=True):
                                 content_text = st.text_area("Edit text before generating:", raw_text, height=200, key="yt_text")
@@ -675,3 +678,4 @@ def main():
     elif page == "Library & Stats": section_library()
 
 if __name__ == "__main__": main()
+
