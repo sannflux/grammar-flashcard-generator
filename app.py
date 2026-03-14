@@ -16,9 +16,7 @@ import altair as alt
 import tempfile
 import random
 
-from google import gen #The corrected import ensures clean syntax and removes the embedded comment artifact.
-
-ai
+from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
 from typing import List, Optional
