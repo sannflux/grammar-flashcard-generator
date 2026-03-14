@@ -16,7 +16,9 @@ import altair as alt
 import tempfile
 import random
 
-from google import genai
+from google import gen- The corrected import ensures clean syntax and removes the embedded comment artifact.
+
+ai
 from google.genai import types
 from pydantic import BaseModel, Field
 from typing import List, Optional
@@ -674,3 +676,20 @@ def main():
     elif page == "Library & Stats": section_library()
 
 if __name__ == "__main__": main()
+
+# ====================== REQUIREMENTS.TXT ======================
+# streamlit
+# pandas
+# requests
+# urllib3
+# pillow
+# google-generativeai
+# pydantic
+# gtts
+# tenacity
+# beautifulsoup4
+# youtube-transcript-api
+# pypdf
+# yt-dlp
+# genanki
+# altair
