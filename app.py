@@ -25,7 +25,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 # ====================== 1. SAFE IMPORTS & CONFIGURATION ======================
 st.set_page_config(
-    page_title="Flashcard Library Pro v6.3", 
+    page_title="Flashcard Library Pro v6.4", 
     page_icon="🧠", 
     layout="wide",
     initial_sidebar_state="expanded"
@@ -158,41 +158,32 @@ def extract_pdf_text(uploaded_file):
         return None, f"Error reading PDF: {str(e)}"
 
 def extract_youtube_id(url):
-    parsed_url = urllib.parse.urlparse(url)
-    if parsed_url.hostname == 'youtu.be':
-        return parsed_url.path[1:]
-    if parsed_url.hostname in ('www.youtube.com', 'youtube.com'):
-        if parsed_url.path == '/watch':
-            return urllib.parse.parse_qs(parsed_url.query).get('v', [None])[0]
-        if parsed_url.path.startswith(('/shorts/', '/embed/', '/v/')):
-            return parsed_url.path.split('/')[2]
-    match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11}).*', url)
+    # Improved robust regex that catches standard, embed, shorts, and youtu.be links
+    match = re.search(r'(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?)\/|.*[?&]v=)|youtu\.be\/)([^"&?\/\s]{11})', url)
     return match.group(1) if match else None
 
-def get_native_youtube_transcript(video_id):
-    """Multi-stage YouTube Extractor."""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-    cookies = {"CONSENT": "YES+cb.20210328-17-p0.en+FX+478"} 
+def get_robust_youtube_transcript(video_id):
+    """Multi-stage, highly robust YouTube Extractor."""
+    raw_text = ""
     
-    # --- STAGE 1: NATIVE HTML PARSE (Forgiving Regex) ---
-    try:
-        html_content = requests.get(f"https://www.youtube.com/watch?v={video_id}", headers=headers, cookies=cookies, timeout=10).text
-        # Forgiving regex looking for "captionTracks" with optional spaces
-        captions_match = re.search(r'"captionTracks"\s*:\s*(\[.*?\])', html_content)
-        if captions_match:
-            captions_json = json.loads(captions_match.group(1))
-            xml_url = captions_json[0]['baseUrl']
-            xml_resp = requests.get(xml_url, headers=headers, timeout=10)
-            clean_text = re.sub(r'<[^>]+>', ' ', xml_resp.text)
-            clean_text = html.unescape(clean_text)
-            return re.sub(r'\s+', ' ', clean_text).strip()
-    except Exception:
-        pass # Fallback to Stage 2
-        
-    # --- STAGE 2: PROXY API FALLBACK ---
+    # --- STAGE 1: Official Library (Best Approach) ---
+    if YOUTUBE_AVAILABLE:
+        try:
+            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+            # Try to fetch ANY available transcript (prefers manual, fallback to auto-generated)
+            transcript = transcript_list.find_transcript(['en', 'en-US', 'en-GB']) 
+            raw_text = " ".join([t['text'] for t in transcript.fetch()])
+            return raw_text
+        except Exception:
+            try:
+                # If no English, grab the very first available transcript (any language)
+                for transcript in transcript_list:
+                    raw_text = " ".join([t['text'] for t in transcript.fetch()])
+                    return raw_text
+            except Exception:
+                pass # Proceed to fallback
+
+    # --- STAGE 2: Proxy API Fallback ---
     try:
         proxy_resp = requests.get(f"https://youtubetranscript.com/?server_vid2={video_id}", timeout=10)
         if '<transcript>' in proxy_resp.text or '<?xml' in proxy_resp.text:
@@ -202,7 +193,7 @@ def get_native_youtube_transcript(video_id):
     except Exception:
         pass
         
-    raise ValueError("All extraction methods failed. The video may not have closed captions.")
+    raise ValueError("Failed to extract transcript. The video may not have closed captions enabled or is region-locked.")
 
 def clean_web_markdown(text):
     text = re.sub(r'<HTML.*?>.*?</HTML>', '', text, flags=re.IGNORECASE | re.DOTALL)
@@ -305,23 +296,14 @@ def section_generator(api_key):
                     try:
                         video_id = extract_youtube_id(url)
                         if not video_id:
-                            raise ValueError("Invalid YouTube URL.")
+                            raise ValueError("Invalid or Unrecognized YouTube URL.")
                         
-                        raw_text = ""
-                        # Plan A: Library
-                        if YOUTUBE_AVAILABLE:
-                            try:
-                                raw_text = " ".join([t['text'] for t in YouTubeTranscriptApi.get_transcript(video_id)])
-                            except Exception:
-                                pass
+                        raw_text = get_robust_youtube_transcript(video_id)
                         
-                        # Plan B & C: Custom Extractor
-                        if not raw_text:
-                            raw_text = get_native_youtube_transcript(video_id)
-                        
-                        st.success("Transcript Extracted Successfully!")
-                        with st.expander("Preview & Edit Transcript", expanded=True):
-                            content_text = st.text_area("Edit text before generating:", raw_text, height=200)
+                        if raw_text:
+                            st.success("Transcript Extracted Successfully!")
+                            with st.expander("Preview & Edit Transcript", expanded=True):
+                                content_text = st.text_area("Edit text before generating:", raw_text, height=200)
                             
                     except Exception as e: 
                         st.error(f"Error extracting transcript: {str(e)}")
