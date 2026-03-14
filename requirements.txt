@@ -1,13 +1,15 @@
-streamlit
-pandas
-requests
+# streamlit
+# pandas
+# requests
+urllib3
+pillow
+google-generativeai
+pydantic
+gtts
+tenacity
 beautifulsoup4
 youtube-transcript-api
 pypdf
-google-genai
-pydantic
-Pillow
-gTTS
-tenacity
-altair
+yt-dlp
 genanki
+altair
