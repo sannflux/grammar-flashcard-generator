@@ -13,12 +13,8 @@ import os
 import html
 from datetime import datetime, timedelta
 import altair as alt
-import tempfile
-import random
 
-from google import gen- The corrected import ensures clean syntax and removes the embedded comment artifact.
-
-ai
+from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
 from typing import List, Optional
@@ -26,24 +22,6 @@ from PIL import Image
 
 from gtts import gTTS
 from tenacity import retry, stop_after_attempt, wait_exponential
-
-import yt_dlp
-from youtube_transcript_api import YouTubeTranscriptApi
-from youtube_transcript_api._errors import NoTranscriptFound, TranscriptsDisabled
-
-try:
-    from bs4 import BeautifulSoup
-    BS4_AVAILABLE = True
-except ImportError:
-    BS4_AVAILABLE = False
-
-try:
-    from pypdf import PdfReader
-    PDF_AVAILABLE = True
-except ImportError:
-    PDF_AVAILABLE = False
-
-import genanki
 
 # ====================== 1. SAFE IMPORTS & CONFIGURATION ======================
 st.set_page_config(
@@ -53,6 +31,24 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+try:
+    from bs4 import BeautifulSoup
+    BS4_AVAILABLE = True
+except ImportError:
+    BS4_AVAILABLE = False
+
+try:
+    from youtube_transcript_api import YouTubeTranscriptApi
+    YOUTUBE_AVAILABLE = True
+except ImportError:
+    YOUTUBE_AVAILABLE = False
+
+try:
+    from pypdf import PdfReader
+    PDF_AVAILABLE = True
+except ImportError:
+    PDF_AVAILABLE = False
+
 DEFAULT_STATE = {
     "current_deck_id": None,
     "study_queue": [],      
@@ -60,9 +56,6 @@ DEFAULT_STATE = {
     "show_answer": False,
     "session_stats": {"reviewed": 0, "correct": 0, "start_time": None},
     "cram_mode": False,
-    "gemini_calls": [],          # timestamps for RPM/RPD enforcement
-    "youtube_cache": {},         # video_id -> (raw_text, metadata)
-    "log_entries": []            # centralized logging
 }
 
 for key, value in DEFAULT_STATE.items():
@@ -137,35 +130,7 @@ def get_due_cards_count():
     with get_db_connection() as conn:
         return conn.execute("SELECT COUNT(*) FROM cards WHERE next_review <= ?", (today,)).fetchone()[0]
 
-# ====================== 4. RATE LIMIT ENFORCEMENT (Free Tier Safeguard) ======================
-def check_and_enforce_rate_limit():
-    now = time.time()
-    calls = st.session_state.gemini_calls
-    
-    # Daily 20 RPD (86400 seconds)
-    today_calls = [t for t in calls if (now - t) < 86400]
-    if len(today_calls) >= 20:
-        st.error("❌ Daily Gemini limit (20 RPD) reached. Please wait until tomorrow.")
-        return False
-    
-    # 5 RPM (60-second rolling window)
-    recent_calls = [t for t in today_calls if (now - t) < 60]
-    if len(recent_calls) >= 5:
-        wait_seconds = 60 - (now - min(recent_calls)) + 1
-        st.warning(f"⏳ Rate limit reached (5 RPM). Waiting {int(wait_seconds)} seconds...")
-        time.sleep(wait_seconds)
-    
-    # Clean old calls
-    st.session_state.gemini_calls = today_calls
-    return True
-
-def log_entry(message):
-    timestamp = datetime.now().strftime("%H:%M:%S")
-    st.session_state.log_entries.append(f"[{timestamp}] {message}")
-    if len(st.session_state.log_entries) > 50:
-        st.session_state.log_entries.pop(0)
-
-# ====================== 5. AI CONTENT ENGINE & EXTRACTORS ======================
+# ====================== 4. AI CONTENT ENGINE & EXTRACTORS ======================
 class Flashcard(BaseModel):
     front: str = Field(description="The question/concept. Plain text.")
     back: str = Field(description="The answer. Use HTML <b> for key terms.")
@@ -204,58 +169,40 @@ def extract_youtube_id(url):
     match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11}).*', url)
     return match.group(1) if match else None
 
-def get_youtube_metadata_and_transcript(url):
-    """Fixed YouTube system: yt-dlp for ALL metadata + youtube-transcript-api for captions.
-    Graceful 'No Transcript Available' handling per spec."""
-    video_id = extract_youtube_id(url)
-    if not video_id:
-        raise ValueError("Invalid YouTube URL.")
-    
-    # Cache check (deduplication)
-    if video_id in st.session_state.youtube_cache:
-        log_entry(f"Cache hit for video {video_id}")
-        return st.session_state.youtube_cache[video_id]
-    
-    # yt-dlp metadata (title, thumbnail, description, duration, live status)
-    ydl_opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'extract_flat': False,
+def get_native_youtube_transcript(video_id):
+    """Multi-stage YouTube Extractor."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
     }
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
-            metadata = {
-                'title': info.get('title', 'Unknown Video'),
-                'thumbnail': info.get('thumbnail'),
-                'description': info.get('description', '')[:5000],
-                'duration': info.get('duration'),
-                'uploader': info.get('uploader'),
-                'is_live': info.get('live_status') == 'is_live'
-            }
-    except Exception as e:
-        metadata = {'title': 'Unknown Video', 'thumbnail': None, 'description': '', 'duration': None, 'uploader': '', 'is_live': False}
-        st.warning(f"yt-dlp metadata warning: {str(e)}")
+    cookies = {"CONSENT": "YES+cb.20210328-17-p0.en+FX+478"} 
     
-    # Primary: youtube-transcript-api
-    raw_text = ""
+    # --- STAGE 1: NATIVE HTML PARSE (Forgiving Regex) ---
     try:
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-        transcript = transcript_list.find_transcript(['en', 'en-US', 'en-GB'])
-        transcript_data = transcript.fetch()
-        raw_text = " ".join([t['text'] for t in transcript_data])
-        log_entry(f"Transcript extracted ({len(raw_text)} chars) for {video_id}")
-    except (NoTranscriptFound, TranscriptsDisabled) as e:
-        st.warning("⚠️ No Transcript Available. Falling back to video description from yt-dlp.")
-        raw_text = metadata['description'] or "No transcript or detailed description available."
-        log_entry(f"No transcript fallback used for {video_id}")
-    except Exception as e:
-        st.error(f"Transcript error: {str(e)}")
-        raw_text = metadata['description'] or ""
-    
-    result = (raw_text, metadata)
-    st.session_state.youtube_cache[video_id] = result
-    return result
+        html_content = requests.get(f"https://www.youtube.com/watch?v={video_id}", headers=headers, cookies=cookies, timeout=10).text
+        # Forgiving regex looking for "captionTracks" with optional spaces
+        captions_match = re.search(r'"captionTracks"\s*:\s*(\[.*?\])', html_content)
+        if captions_match:
+            captions_json = json.loads(captions_match.group(1))
+            xml_url = captions_json[0]['baseUrl']
+            xml_resp = requests.get(xml_url, headers=headers, timeout=10)
+            clean_text = re.sub(r'<[^>]+>', ' ', xml_resp.text)
+            clean_text = html.unescape(clean_text)
+            return re.sub(r'\s+', ' ', clean_text).strip()
+    except Exception:
+        pass # Fallback to Stage 2
+        
+    # --- STAGE 2: PROXY API FALLBACK ---
+    try:
+        proxy_resp = requests.get(f"https://youtubetranscript.com/?server_vid2={video_id}", timeout=10)
+        if '<transcript>' in proxy_resp.text or '<?xml' in proxy_resp.text:
+            clean_text = re.sub(r'<[^>]+>', ' ', proxy_resp.text)
+            clean_text = html.unescape(clean_text)
+            return re.sub(r'\s+', ' ', clean_text).strip()
+    except Exception:
+        pass
+        
+    raise ValueError("All extraction methods failed. The video may not have closed captions.")
 
 def clean_web_markdown(text):
     text = re.sub(r'<HTML.*?>.*?</HTML>', '', text, flags=re.IGNORECASE | re.DOTALL)
@@ -283,28 +230,16 @@ def fetch_web_content(url):
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
 def generate_flashcards(api_key, text_content, image_content, difficulty, count_val):
-    if not check_and_enforce_rate_limit():
-        raise Exception("Rate limit enforced")
-    
     client = genai.Client(api_key=api_key)
     system_prompt = f"Act as a professor for {difficulty} level students. Create {count_val} flashcards strictly based on the core educational content provided. IGNORE website navigation menus, sidebars, 'Log in' prompts, and comment sections. Focus ONLY on the actual definitions, rules, or educational topics. Output JSON only. 'back' field MUST use <b>bold</b> tags for keywords."
     contents = []
     if text_content: contents.append(text_content)
     if image_content: contents.append(image_content)
-    
     response = client.models.generate_content(
         model="gemini-2.5-flash-lite", 
         contents=contents,
         config=types.GenerateContentConfig(system_instruction=system_prompt, response_mime_type="application/json", response_schema=FlashcardSet, temperature=0.3)
     )
-    
-    # Enforce mandatory 12-second sleep between calls (Free Tier safeguard)
-    time.sleep(12)
-    
-    # Record call for limits
-    st.session_state.gemini_calls.append(time.time())
-    log_entry(f"Gemini call completed. Total today: {len([t for t in st.session_state.gemini_calls if (time.time() - t) < 86400])}")
-    
     return json.loads(sanitize_json(response.text)).get("cards", [])
 
 def text_to_speech_html(text):
@@ -318,74 +253,7 @@ def text_to_speech_html(text):
         return f'<audio controls style="height: 30px; width: 100%; margin-top: 10px;"><source src="data:audio/mp3;base64,{b64}" type="audio/mp3"></audio>'
     except Exception: return ""
 
-# ====================== 6. ANKI .APKG GENERATION (Expansion) ======================
-def create_anki_package(deck_name, cards):
-    """Full Anki architecture: genanki deck with custom CSS, media (gTTS audio), timestamped filename."""
-    deck_id = random.randint(1000000000, 9999999999)
-    deck = genanki.Deck(deck_id, deck_name)
-    
-    anki_css = """
-    .card { font-family: Arial; font-size: 20px; text-align: center; color: black; background-color: #ffffff; padding: 20px; }
-    .card.front { font-weight: bold; }
-    .card.back { color: #0066cc; }
-    .card.explanation { font-style: italic; font-size: 16px; margin-top: 15px; border-top: 1px solid #ddd; padding-top: 10px; }
-    .card.tag { background: #0066cc; color: white; padding: 4px 12px; border-radius: 20px; display: inline-block; margin-bottom: 10px; }
-    """
-    
-    model = genanki.Model(
-        1234567890,
-        'Flashcard Library Pro Model',
-        fields=[
-            {'name': 'Front'},
-            {'name': 'Back'},
-            {'name': 'Explanation'},
-            {'name': 'Tag'},
-        ],
-        templates=[{
-            'name': 'Card 1',
-            'qfmt': '<div class="card front">{{Front}}</div><div class="card tag">{{Tag}}</div>',
-            'afmt': '<div class="card front">{{Front}}</div><hr><div class="card back">{{Back}}</div><div class="card explanation">{{Explanation}}</div>',
-        }],
-        css=anki_css
-    )
-    
-    media_files = []
-    for idx, card in enumerate(cards):
-        note = genanki.Note(
-            model=model,
-            fields=[clean_text(card['front']), clean_text(card['back']), card.get('explanation', ''), card.get('tag', 'Anki')]
-        )
-        deck.add_note(note)
-        
-        # Optional audio media (gTTS) for every card
-        try:
-            clean_tts = re.sub(r'<[^>]+>', '', card['front'] + " ... " + card['back'])
-            tts = gTTS(clean_tts, lang='en')
-            audio_path = os.path.join(tempfile.gettempdir(), f"anki_audio_{idx}.mp3")
-            tts.save(audio_path)
-            media_files.append(audio_path)
-        except:
-            pass
-    
-    package = genanki.Package(deck)
-    package.media_files = media_files
-    
-    # Timestamped filename
-    filename = f"{deck_name.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d_%H%M')}.apkg"
-    temp_path = os.path.join(tempfile.gettempdir(), filename)
-    package.write_to_file(temp_path)
-    
-    # Read bytes for Streamlit download
-    with open(temp_path, "rb") as f:
-        apkg_bytes = f.read()
-    os.unlink(temp_path)
-    for mf in media_files:
-        try: os.unlink(mf)
-        except: pass
-    
-    return apkg_bytes, filename
-
-# ====================== 7. UI COMPONENTS & CSS ======================
+# ====================== 5. UI COMPONENTS & CSS ======================
 def inject_custom_css():
     st.markdown("""
     <style>
@@ -397,14 +265,9 @@ def inject_custom_css():
     </style>
     """, unsafe_allow_html=True)
 
-# ====================== 8. APPLICATION SECTIONS ======================
+# ====================== 6. APPLICATION SECTIONS ======================
 def section_generator(api_key):
     st.header("🏭 Flashcard Factory")
-    
-    # Centralized logging pane
-    with st.expander("📋 Live Log (Last 10 entries)", expanded=False):
-        for entry in reversed(st.session_state.log_entries[-10:]):
-            st.caption(entry)
     
     col_input, col_sets = st.columns([2, 1])
     content_text, image_content = "", None
@@ -438,19 +301,30 @@ def section_generator(api_key):
         elif source_type == "YouTube URL":
             url = st.text_input("Video URL")
             if url:
-                if st.button("Extract Video Data", type="secondary"):
-                    with st.spinner("Fetching via yt-dlp + transcript-api..."):
-                        try:
-                            raw_text, metadata = get_youtube_metadata_and_transcript(url)
-                            st.success(f"✅ Extracted: **{metadata['title']}**")
-                            if metadata['thumbnail']:
-                                st.image(metadata['thumbnail'], width=300)
-                            suggested_deck = metadata['title'][:60]
-                            with st.expander("Preview & Edit Transcript", expanded=True):
-                                content_text = st.text_area("Edit text before generating:", raw_text, height=200, key="yt_text")
-                                deck_name = st.text_input("Deck Name", value=suggested_deck, key="yt_deck")
-                        except Exception as e: 
-                            st.error(f"Error: {str(e)}")
+                with st.spinner("Transcribing..."):
+                    try:
+                        video_id = extract_youtube_id(url)
+                        if not video_id:
+                            raise ValueError("Invalid YouTube URL.")
+                        
+                        raw_text = ""
+                        # Plan A: Library
+                        if YOUTUBE_AVAILABLE:
+                            try:
+                                raw_text = " ".join([t['text'] for t in YouTubeTranscriptApi.get_transcript(video_id)])
+                            except Exception:
+                                pass
+                        
+                        # Plan B & C: Custom Extractor
+                        if not raw_text:
+                            raw_text = get_native_youtube_transcript(video_id)
+                        
+                        st.success("Transcript Extracted Successfully!")
+                        with st.expander("Preview & Edit Transcript", expanded=True):
+                            content_text = st.text_area("Edit text before generating:", raw_text, height=200)
+                            
+                    except Exception as e: 
+                        st.error(f"Error extracting transcript: {str(e)}")
 
         elif source_type == "Web Article":
             url = st.text_input("Article URL")
@@ -470,12 +344,10 @@ def section_generator(api_key):
         qty = st.number_input("Count", 1, 30, 10)
         
         if st.button("🚀 Generate via AI", type="primary", use_container_width=True):
-            if not api_key: 
-                st.error("API Key Missing"); return
-            if not (content_text or image_content): 
-                st.warning("No valid content"); return
+            if not api_key: st.error("API Key Missing"); return
+            if not (content_text or image_content): st.warning("No valid content"); return
             
-            with st.spinner("Gemini is thinking... (12s safety delay enforced)"):
+            with st.spinner("Gemini is thinking..."):
                 try:
                     cards = generate_flashcards(api_key, content_text, image_content, difficulty, qty)
                     if cards and deck_name:
@@ -487,9 +359,7 @@ def section_generator(api_key):
                             c.executemany("INSERT INTO cards (deck_id, front, back, explanation, tag) VALUES (?, ?, ?, ?, ?)", data)
                             conn.commit()
                         st.success(f"Created {len(cards)} cards!")
-                        log_entry(f"Deck '{deck_name}' created with {len(cards)} cards")
-                except Exception as e: 
-                    st.error(f"Failed: {e}")
+                except Exception as e: st.error(f"Failed: {e}")
 
     with st.expander("✍️ Create Flashcard Manually"):
         with st.form("manual_card", clear_on_submit=True):
@@ -599,7 +469,7 @@ def section_library():
         
     if decks.empty: st.info("No decks."); return
 
-    t1, t2, t3, t4, t5 = st.tabs(["📊 Stats", "✏️ Edit Cards", "📤 CSV Export", "📦 Anki Export", "🗑️ Manage"])
+    t1, t2, t3, t4 = st.tabs(["📊 Stats", "✏️ Edit Cards", "📤 Export", "🗑️ Manage"])
 
     with t1:
         if not df_cards.empty:
@@ -622,30 +492,12 @@ def section_library():
                 st.success("Updated!")
 
     with t3:
-        export_deck = st.selectbox("Export Deck (CSV)", decks['name'].tolist())
+        export_deck = st.selectbox("Export Deck", decks['name'].tolist())
         deck_id_raw = decks[decks['name'] == export_deck].iloc[0]['id']
         with get_db_connection() as conn: cards_df = pd.read_sql("SELECT front, back, tag FROM cards WHERE deck_id=?", conn, params=(int(deck_id_raw),))
         st.download_button("Download CSV", data=cards_df.to_csv(index=False, header=False).encode('utf-8') if not cards_df.empty else b"", file_name=f"{export_deck}.csv", disabled=cards_df.empty)
 
     with t4:
-        export_deck_anki = st.selectbox("Export Deck (Anki .apkg)", decks['name'].tolist())
-        if st.button("Generate & Download .apkg", type="primary"):
-            deck_id_raw = decks[decks['name'] == export_deck_anki].iloc[0]['id']
-            with get_db_connection() as conn:
-                cards = conn.execute("SELECT front, back, explanation, tag FROM cards WHERE deck_id=?", (int(deck_id_raw),)).fetchall()
-            if cards:
-                apkg_bytes, filename = create_anki_package(export_deck_anki, cards)
-                st.download_button(
-                    label="📥 Download Anki Deck",
-                    data=apkg_bytes,
-                    file_name=filename,
-                    mime="application/octet-stream"
-                )
-                st.success(f"Anki deck '{filename}' ready with custom CSS + audio media!")
-            else:
-                st.warning("No cards in deck.")
-
-    with t5:
         c1, c2 = st.columns(2)
         with c1:
             ren = st.selectbox("Rename", decks['name'].tolist(), key="r_sel")
@@ -662,13 +514,8 @@ def main():
     with st.sidebar:
         st.title("🧠 Flashcard Pro")
         api_key = st.text_input("Gemini API Key", type="password")
-        
-        # Free Tier indicators
-        calls_today = len([t for t in st.session_state.gemini_calls if (time.time() - t) < 86400])
-        st.metric("Gemini Calls Today", f"{calls_today}/20")
         st.metric("Cards Due Today", get_due_cards_count())
         st.divider()
-        
         page = st.radio("Navigation", ["Study Mode", "Generator", "Library & Stats"], label_visibility="collapsed")
     
     if page == "Generator": section_generator(api_key)
