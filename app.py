@@ -13,7 +13,7 @@ from typing import List
 
 # ====================== DATABASE & CONFIG ======================
 DB_NAME = "flashcards_v7.db"
-st.set_page_config(page_title="Flashcard Pro v7.6", layout="wide")
+st.set_page_config(page_title="Flashcard Pro v7.7", layout="wide")
 
 def init_db():
     with sqlite3.connect(DB_NAME) as conn:
@@ -26,77 +26,61 @@ def init_db():
 
 init_db()
 
-# ====================== THE "SECRET SAUCE" BYPASS ======================
+# ====================== THE EXTRACTOR ======================
 
-def prepare_cookies():
-    """Converts JSON to Netscape. Mandatory for v7.6."""
+def get_transcript_v7_7(video_id):
+    """Attempt auto-fetch, but fail gracefully with explanation."""
+    import yt_dlp
+    
+    # Check for cookies
     json_path = "youtube_cookies.json"
     txt_path = "youtube_cookies.txt"
-    if not os.path.exists(json_path): return None
-    try:
-        with open(json_path, 'r') as f:
-            cookies = json.load(f)
-        with open(txt_path, 'w') as f:
-            f.write("# Netscape HTTP Cookie File\n")
-            for c in cookies:
-                domain = c.get('domain', '')
-                flag = "TRUE" if domain.startswith('.') else "FALSE"
-                path = c.get('path', '/')
-                secure = "TRUE" if c.get('secure') else "FALSE"
-                expiry = int(c.get('expirationDate', 0))
-                name = c.get('name', '')
-                value = c.get('value', '')
-                f.write(f"{domain}\t{flag}\t{path}\t{secure}\t{expiry}\t{name}\t{value}\n")
-        return txt_path
-    except: return None
-
-def get_transcript_v7_6(video_id):
-    """Bypasses 'Format not available' by using the 'extract_flat' method."""
-    cookie_file = prepare_cookies()
+    cookie_file = None
     
-    import yt_dlp
+    if os.path.exists(json_path):
+        try:
+            with open(json_path, 'r') as f:
+                cookies = json.load(f)
+            with open(txt_path, 'w') as f:
+                f.write("# Netscape HTTP Cookie File\n")
+                for c in cookies:
+                    domain = c.get('domain', '')
+                    f.write(f"{domain}\tTRUE\t/\tTRUE\t{int(c.get('expirationDate', 0))}\t{c.get('name', '')}\t{c.get('value', '')}\n")
+            cookie_file = txt_path
+        except: pass
+
     ydl_opts = {
         'skip_download': True,
         'quiet': True,
-        'no_warnings': True,
         'cookiefile': cookie_file,
-        # CRITICAL FIX: Tell yt-dlp NOT to check for video formats
-        'check_formats': False, 
-        'ignore_no_formats_error': True,
         'writesubtitles': True,
         'writeautomaticsub': True,
-        'subtitleslangs': ['en.*', 'id.*'], # Catch any English or Indonesian variant
+        'subtitleslangs': ['en.*', 'id.*'],
+        'check_formats': False, 
         'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
     }
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        # We use download=False and let it fail gracefully on formats
-        info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
-        
-        sub_url = None
-        # Logic to grab subtitles even if video formats are hidden
-        for lang_key in ['en', 'en-US', 'id']:
-            if 'subtitles' in info and lang_key in info['subtitles']:
-                sub_url = info['subtitles'][lang_key][0]['url']
-                break
-            if not sub_url and 'automatic_captions' in info and lang_key in info['automatic_captions']:
-                # Find JSON3 if possible
-                for f in info['automatic_captions'][lang_key]:
-                    if 'json3' in f.get('url', ''):
-                        sub_url = f['url']
-                        break
-                if not sub_url: sub_url = info['automatic_captions'][lang_key][0]['url']
-                break
-
-        if sub_url:
-            r = requests.get(sub_url)
-            if 'json3' in sub_url or '"events"' in r.text:
-                data = r.json()
-                return " ".join([s['utf8'] for e in data.get('events', []) for s in e.get('segs', []) if 'utf8' in s])
-            return re.sub(r'<[^>]+>', '', r.text)
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+            # Search for subtitle URLs
+            sub_url = None
+            if 'subtitles' in info and info['subtitles']:
+                sub_url = next(iter(info['subtitles'].values()))[0]['url']
+            elif 'automatic_captions' in info and info['automatic_captions']:
+                sub_url = next(iter(info['automatic_captions'].values()))[0]['url']
+            
+            if sub_url:
+                r = requests.get(sub_url)
+                if 'json3' in sub_url:
+                    data = r.json()
+                    return " ".join([s['utf8'] for e in data.get('events', []) for s in e.get('segs', []) if 'utf8' in s])
+                return re.sub(r'<[^>]+>', '', r.text)
+    except Exception as e:
+        return f"BLOCK_ERROR: {str(e)}"
     return None
 
-# ====================== AI & UI ======================
+# ====================== AI LOGIC ======================
 
 class Flashcard(BaseModel):
     front: str
@@ -111,49 +95,73 @@ def generate_cards(api_key, text, qty):
     client = genai.Client(api_key=api_key)
     response = client.models.generate_content(
         model="gemini-2.0-flash",
-        contents=[f"Content: {text}"],
+        contents=[f"Create {qty} flashcards from: {text}"],
         config=types.GenerateContentConfig(
-            system_instruction=f"Generate {qty} flashcards in JSON.",
+            system_instruction="Output JSON matching schema. Use <b>bold</b>.",
             response_mime_type="application/json",
             response_schema=FlashcardSet
         )
     )
     return json.loads(response.text).get("cards", [])
 
+# ====================== UI ======================
+
 def main():
-    st.title("🧠 Flashcard Pro v7.6 (The Final Fix)")
+    st.title("🧠 Flashcard Factory v7.7")
     
     api_key = st.sidebar.text_input("Gemini API Key", type="password")
-    url = st.text_input("YouTube URL")
+    
+    if "final_text" not in st.session_state:
+        st.session_state.final_text = ""
 
-    if st.button("Magic Build"):
-        if not api_key:
-            st.error("Missing API Key")
-            return
-
-        vid = re.search(r"(?:v=|\/)([0-9A-Za-z_-]{11})", url)
-        if vid:
-            with st.spinner("Extracting content (Force-Bypassing Blocks)..."):
-                try:
-                    text = get_transcript_v7_6(vid.group(1))
-                    if text:
-                        cards = generate_cards(api_key, text, 10)
-                        # DB Saving logic
-                        with sqlite3.connect(DB_NAME) as conn:
-                            c = conn.cursor()
-                            c.execute("INSERT OR IGNORE INTO decks (name) VALUES (?)", ("Auto Deck",))
-                            d_id = c.execute("SELECT id FROM decks WHERE name='Auto Deck'").fetchone()[0]
-                            for card in cards:
-                                c.execute("INSERT INTO cards (deck_id, front, back, explanation, tag, next_review) VALUES (?,?,?,?,?,?)",
-                                          (d_id, card['front'], card['back'], card['explanation'], card['tag'], datetime.now().date()))
-                        st.balloons()
-                        st.success(f"Created {len(cards)} cards!")
+    url = st.text_input("1. YouTube Link")
+    
+    col_auto, col_manual = st.columns(2)
+    
+    with col_auto:
+        if st.button("🪄 Auto-Fetch Content"):
+            vid = re.search(r"(?:v=|\/)([0-9A-Za-z_-]{11})", url)
+            if vid:
+                with st.spinner("Battling YouTube..."):
+                    res = get_transcript_v7_7(vid.group(1))
+                    if res and "BLOCK_ERROR" not in res:
+                        st.session_state.final_text = res
+                        st.success("Success! Text loaded.")
                     else:
-                        st.error("No transcript found. YouTube is successfully hiding the content.")
-                except Exception as e:
-                    st.error(f"Fatal Block: {e}")
+                        st.error("YouTube Blocked the Auto-Fetch.")
+                        st.info("The server IP is flagged. Please use the 'Manual' box to the right.")
+
+    with col_manual:
+        st.session_state.final_text = st.text_area("2. Or Paste Transcript Manually:", 
+                                                  value=st.session_state.final_text, 
+                                                  placeholder="Paste from 'Show Transcript' here...",
+                                                  height=150)
+
+    deck_name = st.text_input("3. Deck Name", "New Study Set")
+    
+    if st.button("🚀 Build Flashcards", type="primary"):
+        if not api_key:
+            st.error("Enter API Key")
+        elif len(st.session_state.final_text) < 100:
+            st.error("Content too short. Paste or fetch more text.")
         else:
-            st.error("Invalid URL")
+            with st.spinner("AI is thinking..."):
+                try:
+                    cards = generate_cards(api_key, st.session_state.final_text, 10)
+                    # Database save
+                    with sqlite3.connect(DB_NAME) as conn:
+                        c = conn.cursor()
+                        c.execute("INSERT OR IGNORE INTO decks (name) VALUES (?)", (deck_name,))
+                        d_id = c.execute("SELECT id FROM decks WHERE name=?", (deck_name,)).fetchone()[0]
+                        for card in cards:
+                            c.execute("INSERT INTO cards (deck_id, front, back, explanation, tag, next_review) VALUES (?,?,?,?,?,?)",
+                                      (d_id, card['front'], card['back'], card['explanation'], card['tag'], datetime.now().date()))
+                    st.balloons()
+                    for card in cards:
+                        with st.expander(card['front']):
+                            st.write(card['back'])
+                except Exception as e:
+                    st.error(f"AI Error: {e}")
 
 if __name__ == "__main__":
     main()
