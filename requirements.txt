@@ -1,6 +1,6 @@
-# streamlit
-# pandas
-# requests
+streamlit
+pandas
+requests
 urllib3
 pillow
 google-generativeai
