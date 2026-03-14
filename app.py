@@ -676,20 +676,3 @@ def main():
     elif page == "Library & Stats": section_library()
 
 if __name__ == "__main__": main()
-
-# ====================== REQUIREMENTS.TXT ======================
-# streamlit
-# pandas
-# requests
-# urllib3
-# pillow
-# google-generativeai
-# pydantic
-# gtts
-# tenacity
-# beautifulsoup4
-# youtube-transcript-api
-# pypdf
-# yt-dlp
-# genanki
-# altair
