@@ -1,12 +1,13 @@
 streamlit
 pandas
-altair
 requests
 beautifulsoup4
-youtube-transcript-api==0.6.2
+youtube-transcript-api
 pypdf
 google-genai
 pydantic
 Pillow
 gTTS
 tenacity
+altair
+genanki
