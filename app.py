@@ -11,18 +11,16 @@ import io
 import base64
 import os
 import html
-from datetime import datetime
-
-
+from datetime import datetime, timedelta
 import altair as alt
 import tempfile
 import random
 
-from google import genai
-from google.genai import types
-from pydantic import Base- Ensure no internal notes or smart quotes remain in final code output.
+from google import gen #The corrected import ensures clean syntax and removes the embedded comment artifact.
 
-Model, Field
+ai
+from google.genai import types
+from pydantic import BaseModel, Field
 from typing import List, Optional
 from PIL import Image
 
@@ -678,4 +676,3 @@ def main():
     elif page == "Library & Stats": section_library()
 
 if __name__ == "__main__": main()
-
