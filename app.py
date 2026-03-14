@@ -13,7 +13,7 @@ from typing import List
 
 # ====================== DATABASE & CONFIG ======================
 DB_NAME = "flashcards_v7.db"
-st.set_page_config(page_title="Flashcard Pro v7.0", layout="wide")
+st.set_page_config(page_title="Flashcard Pro v7.1", layout="wide")
 
 def init_db():
     with sqlite3.connect(DB_NAME) as conn:
@@ -26,67 +26,100 @@ def init_db():
 
 init_db()
 
-# ====================== THE BYPASS ENGINE ======================
+# ====================== THE COOKIE TRANSLATOR ======================
 
-def get_transcript_v7(video_id):
-    """
-    Uses yt-dlp directly via subprocess. 
-    This is the most 'brute force' way to get transcripts in 2026.
-    """
-    json_cookie_path = "youtube_cookies.json"
-    output_file = f"{video_id}_subs"
+def json_to_netscape():
+    """Converts your Kiwi JSON cookies to the Netscape .txt format yt-dlp requires."""
+    json_path = "youtube_cookies.json"
+    txt_path = "youtube_cookies.txt"
     
-    # Check if cookies exist
-    cookie_arg = f"--cookies {json_cookie_path}" if os.path.exists(json_cookie_path) else ""
-    
-    # Command to yt-dlp: Get subtitles, don't download video, output to terminal
-    # We use --get-subs and --skip-download
-    cmd = f'yt-dlp --get-subs --skip-download --sub-langs "en.*,id.*" --write-auto-subs {cookie_arg} https://www.youtube.com/watch?v={video_id}'
-    
+    if not os.path.exists(json_path):
+        return None
+
     try:
-        # We attempt to use the python library first as it's cleaner
-        import yt_dlp
-        ydl_opts = {
-            'skip_download': True,
-            'writeautomaticsub': True,
-            'subtitleslangs': ['en', 'id'],
-            'quiet': True,
-            'cookiefile': json_cookie_path if os.path.exists(json_cookie_path) else None
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
-            
-            # Locate the subtitle URL
-            sub_url = None
-            if 'subtitles' in info and len(info['subtitles']) > 0:
-                # Prefer manual subtitles
-                lang = list(info['subtitles'].keys())[0]
-                sub_url = info['subtitles'][lang][0]['url']
-            elif 'automatic_captions' in info and len(info['automatic_captions']) > 0:
-                # Fallback to auto-generated
-                lang = 'en' if 'en' in info['automatic_captions'] else list(info['automatic_captions'].keys())[0]
-                # Filter for 'json3' format which is easiest to parse
-                for formats in info['automatic_captions'][lang]:
-                    if formats.get('ext') == 'json3' or 'fmt=json3' in formats.get('url', ''):
-                        sub_url = formats['url']
-                        break
-                if not sub_url: sub_url = info['automatic_captions'][lang][0]['url']
-
-            if sub_url:
-                resp = subprocess.check_output(['curl', '-L', sub_url], stderr=subprocess.STDOUT)
-                # If it's JSON3 format, we parse it
-                try:
-                    data = json.loads(resp)
-                    full_text = " ".join([event['segs'][0]['utf8'] for event in data['events'] if 'segs' in event])
-                    return full_text
-                except:
-                    # If it's VTT format, we just strip the tags
-                    raw_text = resp.decode('utf-8')
-                    clean_text = re.sub(r'<[^>]+>', '', raw_text) # Remove HTML tags
-                    clean_text = re.sub(r'\d{2}:\d{2}:\d{2}.\d{3}.*', '', clean_text) # Remove timestamps
-                    return clean_text
+        with open(json_path, 'r') as f:
+            cookies = json.load(f)
+        
+        with open(txt_path, 'w') as f:
+            f.write("# Netscape HTTP Cookie File\n")
+            f.write("# This file is generated from JSON\n")
+            for c in cookies:
+                # Handle domain dots
+                domain = c.get('domain', '')
+                flag = "TRUE" if domain.startswith('.') else "FALSE"
+                path = c.get('path', '/')
+                secure = "TRUE" if c.get('secure') else "FALSE"
+                # Expiry must be an integer
+                expiry = int(c.get('expirationDate', 0))
+                name = c.get('name', '')
+                value = c.get('value', '')
+                
+                # Format: domain - flag - path - secure - expiry - name - value
+                line = f"{domain}\t{flag}\t{path}\t{secure}\t{expiry}\t{name}\t{value}\n"
+                f.write(line)
+        return txt_path
     except Exception as e:
-        raise ValueError(f"Bypass failed. YouTube's bot wall is too strong for your current IP. Error: {str(e)}")
+        st.error(f"Cookie Conversion Failed: {e}")
+        return None
+
+# ====================== THE UPDATED BYPASS ENGINE ======================
+
+def get_transcript_v7_1(video_id):
+    """Uses converted Netscape cookies to get the transcript."""
+    # Step 1: Convert the JSON you provided into the format YouTube wants
+    cookie_file = json_to_netscape()
+    
+    if not cookie_file:
+        raise ValueError("No youtube_cookies.json found in the folder!")
+
+    import yt_dlp
+    ydl_opts = {
+        'skip_download': True,
+        'writeautomaticsub': True,
+        'subtitleslangs': ['en', 'id'],
+        'quiet': True,
+        'cookiefile': cookie_file, # Now using the .txt file!
+        'no_warnings': True,
+    }
+    
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+        
+        sub_url = None
+        # Check for manual subs first
+        if 'subtitles' in info and info['subtitles']:
+            for lang in ['en', 'id']:
+                if lang in info['subtitles']:
+                    sub_url = info['subtitles'][lang][0]['url']
+                    break
+        
+        # Fallback to auto-captions
+        if not sub_url and 'automatic_captions' in info:
+            for lang in ['en', 'id']:
+                if lang in info['automatic_captions']:
+                    # Look for json3 format first
+                    for fmt in info['automatic_captions'][lang]:
+                        if fmt.get('ext') == 'json3' or 'fmt=json3' in fmt.get('url', ''):
+                            sub_url = fmt['url']
+                            break
+                    if not sub_url:
+                        sub_url = info['automatic_captions'][lang][0]['url']
+                    break
+
+        if sub_url:
+            # Download the actual subtitle content
+            resp = requests.get(sub_url)
+            if resp.ok:
+                if 'fmt=json3' in sub_url or '"events"' in resp.text:
+                    data = resp.json()
+                    return " ".join([s['utf8'] for e in data.get('events', []) for s in e.get('segs', []) if 'utf8' in s])
+                else:
+                    # Strip VTT tags
+                    clean = re.sub(r'<[^>]+>', '', resp.text)
+                    clean = re.sub(r'\d{2}:\d{2}.*', '', clean)
+                    return clean
+
+    return None
 
 # ====================== AI & UI ======================
 
@@ -103,9 +136,9 @@ def generate_cards(api_key, text, qty):
     client = genai.Client(api_key=api_key)
     response = client.models.generate_content(
         model="gemini-2.0-flash",
-        contents=[f"Create {qty} flashcards from this: {text}"],
+        contents=[f"Create {qty} flashcards from this text: {text}"],
         config=types.GenerateContentConfig(
-            system_instruction="Output JSON matching the schema.",
+            system_instruction="Provide educational flashcards in JSON format.",
             response_mime_type="application/json",
             response_schema=FlashcardSet
         )
@@ -113,36 +146,38 @@ def generate_cards(api_key, text, qty):
     return json.loads(response.text).get("cards", [])
 
 def main():
-    st.title("🚀 Flashcard Pro v7.0 (The Fix)")
+    st.title("🚀 Flashcard Magic v7.1")
     
     api_key = st.sidebar.text_input("Gemini API Key", type="password")
-    url = st.text_input("YouTube URL")
+    url = st.text_input("Paste YouTube Link")
     
-    if st.button("Magic Generate (Like Before)"):
+    if st.button("Generate Automatically"):
         if not api_key:
-            st.error("Enter API Key")
+            st.error("API Key is missing!")
             return
             
         vid_match = re.search(r"(?:v=|\/)([0-9A-Za-z_-]{11})", url)
         if vid_match:
             vid = vid_match.group(1)
-            with st.spinner("Executing Stage 3 Bypass..."):
+            with st.spinner("Bypassing YouTube Wall..."):
                 try:
-                    text = get_transcript_v7(vid)
+                    text = get_transcript_v7_1(vid)
                     if text:
                         cards = generate_cards(api_key, text, 10)
                         for card in cards:
-                            st.write(f"**Front:** {card['front']}")
-                            st.write(f"**Back:** {card['back']}")
-                            st.divider()
-                        st.success("Done!")
+                            with st.container():
+                                st.markdown(f"**Q:** {card['front']}")
+                                st.markdown(f"**A:** {card['back']}")
+                                st.caption(card['explanation'])
+                                st.divider()
+                        st.success("Success!")
+                    else:
+                        st.error("Could not find subtitles for this video.")
                 except Exception as e:
-                    st.error(f"YouTube Blocked the Automatic Fetch: {e}")
-                    st.info("Since the auto-fetch failed, use the 'Show Transcript' button on YouTube and paste the text below.")
-                    manual_text = st.text_area("Paste Transcript manually:")
-                    if st.button("Generate from Paste"):
-                         cards = generate_cards(api_key, manual_text, 10)
-                         st.json(cards)
+                    st.error(f"Error: {e}")
+                    st.info("YouTube is still blocking the automated request. Try running the app locally or paste the text manually.")
+        else:
+            st.error("Invalid URL")
 
 if __name__ == "__main__":
     main()
