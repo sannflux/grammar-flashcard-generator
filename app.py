@@ -11,7 +11,9 @@ import io
 import base64
 import os
 import html
+import hashlib
 import functools
+import tempfile
 from datetime import datetime, timedelta
 import altair as alt
 
@@ -38,7 +40,6 @@ try:
 except ImportError:
     BS4_AVAILABLE = False
 
-# ── YouTube: v1.x API with formatters & exception classes ────────────────────
 try:
     from youtube_transcript_api import (
         YouTubeTranscriptApi,
@@ -56,8 +57,13 @@ try:
 except ImportError:
     PDF_AVAILABLE = False
 
+try:
+    import genanki
+    GENANKI_AVAILABLE = True
+except ImportError:
+    GENANKI_AVAILABLE = False
+
 # ====================== PRE-COMPILED REGEX PATTERNS ======================
-# Compiled once at import time — never recompiled per-call
 _RE_BOLD            = re.compile(r'\*\*(.*?)\*\*')
 _RE_CODE_FENCE_JSON = re.compile(r'^```json', re.MULTILINE)
 _RE_CODE_FENCE      = re.compile(r'^```',     re.MULTILINE)
@@ -70,8 +76,10 @@ _RE_MULTILINE       = re.compile(r'\n\s*\n')
 _RE_CAPTIONS        = re.compile(r'"captionTracks"\s*:\s*(\[.*?\])')
 _RE_ACCESS_DENIED   = re.compile(r'Access Denied|edgesuite\.net|Reference #')
 
-# ====================== API RATE-LIMIT CONSTANTS ======================
-_API_MIN_INTERVAL = 12.0   # seconds — enforces 5 RPM (Free Tier)
+# ====================== API RATE-LIMIT & BUDGET CONSTANTS ======================
+_API_MIN_INTERVAL = 12.0
+_API_DAILY_LIMIT  = 20
+_API_WARN_AT      = 18
 
 # ====================== SESSION STATE DEFAULTS ======================
 DEFAULT_STATE = {
@@ -81,7 +89,12 @@ DEFAULT_STATE = {
     "show_answer":      False,
     "session_stats":    {"reviewed": 0, "correct": 0, "start_time": None},
     "cram_mode":        False,
-    "last_api_call_ts": 0.0,   # time.perf_counter() of last Gemini call
+    "last_api_call_ts": 0.0,
+    "api_budget":       {"date": datetime.now().strftime("%Y-%m-%d"), "count": 0},
+    "_db_initialized":  False,
+    # YouTube cookie state
+    "yt_cookie_path":   None,   # path to converted Netscape temp file on disk
+    "yt_cookie_hash":   "",     # MD5 of uploaded JSON — detects re-uploads
 }
 
 for key, value in DEFAULT_STATE.items():
@@ -92,15 +105,17 @@ for key, value in DEFAULT_STATE.items():
 DB_NAME = "flashcards_v5.db"
 
 def get_db_connection():
-    """Open a SQLite connection with WAL, 8 MB read cache, and NORMAL sync."""
     conn = sqlite3.connect(DB_NAME, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA cache_size=-8000;")     # 8 MB page cache
-    conn.execute("PRAGMA synchronous=NORMAL;")   # Safe with WAL; ~2× faster writes
+    conn.execute("PRAGMA cache_size=-8000;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA temp_store=MEMORY;")
+    conn.execute("PRAGMA mmap_size=268435456;")
     return conn
 
-def init_db():
+def init_db() -> bool:
+    migrated = False
     with get_db_connection() as conn:
         c = conn.cursor()
         c.execute('''CREATE TABLE IF NOT EXISTS decks (
@@ -121,21 +136,20 @@ def init_db():
             next_review TEXT DEFAULT CURRENT_DATE,
             last_reviewed TEXT,
             FOREIGN KEY(deck_id) REFERENCES decks(id) ON DELETE CASCADE)''')
-
-        # Schema migration guards
-        try:    c.execute("SELECT explanation FROM cards LIMIT 1")
+        try:
+            c.execute("SELECT explanation FROM cards LIMIT 1")
         except sqlite3.OperationalError:
             c.execute("ALTER TABLE cards ADD COLUMN explanation TEXT DEFAULT ''")
-        try:    c.execute("SELECT last_reviewed FROM cards LIMIT 1")
+            migrated = True
+        try:
+            c.execute("SELECT last_reviewed FROM cards LIMIT 1")
         except sqlite3.OperationalError:
             c.execute("ALTER TABLE cards ADD COLUMN last_reviewed TEXT")
-
-        # ── Performance indexes (idempotent) ─────────────────────────────
+            migrated = True
         c.execute("CREATE INDEX IF NOT EXISTS idx_cards_deck_review ON cards(deck_id, next_review)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_cards_deck_id    ON cards(deck_id)")
         conn.commit()
-
-init_db()
+    return migrated
 
 # ====================== 3. CORE LOGIC ======================
 def update_card_sm2(card_id, quality):
@@ -164,6 +178,14 @@ def delete_deck(deck_name):
         conn.execute("DELETE FROM decks WHERE name=?", (deck_name,))
         conn.commit()
 
+def delete_cards_by_ids(card_ids: list):
+    if not card_ids:
+        return
+    placeholders = ",".join("?" * len(card_ids))
+    with get_db_connection() as conn:
+        conn.execute(f"DELETE FROM cards WHERE id IN ({placeholders})", card_ids)
+        conn.commit()
+
 def rename_deck(old_name, new_name):
     try:
         with get_db_connection() as conn:
@@ -175,12 +197,26 @@ def rename_deck(old_name, new_name):
 
 @st.cache_data(ttl=30, show_spinner=False)
 def get_due_cards_count():
-    """Cached for 30 s — prevents a DB query on every single UI interaction."""
     today = datetime.now().strftime("%Y-%m-%d")
     with get_db_connection() as conn:
         return conn.execute(
             "SELECT COUNT(*) FROM cards WHERE next_review <= ?", (today,)
         ).fetchone()[0]
+
+def _increment_api_budget():
+    today  = datetime.now().strftime("%Y-%m-%d")
+    budget = st.session_state["api_budget"]
+    if budget["date"] != today:
+        st.session_state["api_budget"] = {"date": today, "count": 0}
+    st.session_state["api_budget"]["count"] += 1
+
+def _get_api_budget_count() -> int:
+    today  = datetime.now().strftime("%Y-%m-%d")
+    budget = st.session_state["api_budget"]
+    if budget["date"] != today:
+        st.session_state["api_budget"] = {"date": today, "count": 0}
+        return 0
+    return budget["count"]
 
 # ====================== 4. AI CONTENT ENGINE & EXTRACTORS ======================
 class Flashcard(BaseModel):
@@ -200,22 +236,120 @@ def sanitize_json(text):
     text = _RE_CODE_FENCE_JSON.sub('', text)
     return _RE_CODE_FENCE.sub('', text).strip()
 
-def extract_pdf_text(uploaded_file):
+# ── PDF extraction ────────────────────────────────────────────────────────────
+
+@st.cache_data(show_spinner=False)
+def extract_pdf_text(file_hash: str, file_bytes: bytes):
     try:
-        reader = PdfReader(io.BytesIO(uploaded_file.getvalue()))
-        text   = "".join((page.extract_text() or "") + "\n" for page in reader.pages)
-        return text[:25000], None
+        reader = PdfReader(io.BytesIO(file_bytes))
+        chunks, total = [], 0
+        for page in reader.pages:
+            page_text = (page.extract_text() or "") + "\n"
+            chunks.append(page_text)
+            total += len(page_text)
+            if total >= 25_000:
+                break
+        return "".join(chunks)[:25_000], None
     except Exception as e:
         return None, f"Error reading PDF: {str(e)}"
 
-# ── YouTube helpers ───────────────────────────────────────────────────────────
+def hash_uploaded_file(uploaded_file) -> str:
+    return hashlib.md5(uploaded_file.getvalue()).hexdigest()
+
+# ── Image compression ─────────────────────────────────────────────────────────
+
+def compress_image(img: Image.Image, max_px: int = 1024, quality: int = 85) -> Image.Image:
+    ratio = min(max_px / max(img.width, img.height), 1.0)
+    if ratio < 1.0:
+        img = img.resize((int(img.width * ratio), int(img.height * ratio)), Image.LANCZOS)
+    if img.mode in ("RGBA", "P", "LA"):
+        img = img.convert("RGB")
+    return img
+
+# ── YouTube cookie converter ──────────────────────────────────────────────────
+
+def convert_cookies_json_to_netscape(json_bytes: bytes) -> tuple[str, int]:
+    """
+    Converts a Cookie-Editor JSON export to Netscape HTTP Cookie File format.
+
+    Handles the Cookie-Editor schema exactly:
+      domain, expirationDate, hostOnly, httpOnly, name, path,
+      sameSite, secure, session, storeId, value
+
+    Deduplication strategy: when (name, domain) collide — which happens
+    frequently in Cookie-Editor exports — keep the entry with the LATEST
+    expirationDate so stale tokens never shadow fresh ones.
+
+    Returns (netscape_string, cookie_count).
+    """
+    raw = json.loads(json_bytes.decode("utf-8"))
+
+    # ── Step 1: deduplicate by (name, domain), keep latest expiration ────
+    deduped: dict = {}
+    for c in raw:
+        key      = (c["name"], c["domain"])
+        new_exp  = float(c.get("expirationDate") or 0)
+        prev_exp = float((deduped[key].get("expirationDate") or 0)) if key in deduped else -1
+        if new_exp > prev_exp:
+            deduped[key] = c
+
+    # ── Step 2: emit Netscape lines ───────────────────────────────────────
+    lines = [
+        "# Netscape HTTP Cookie File",
+        "# Converted from Cookie-Editor JSON by Flashcard Pro",
+    ]
+    for c in deduped.values():
+        domain      = c["domain"]
+        # Netscape "include_subdomains" = TRUE when domain starts with "."
+        # (matches hostOnly=false in Cookie-Editor)
+        subdomain   = "TRUE" if domain.startswith(".") else "FALSE"
+        path        = c.get("path", "/")
+        secure      = "TRUE" if c.get("secure", False) else "FALSE"
+        # session=true means no persistent expiry → use 0
+        expiry      = int(float(c["expirationDate"])) if c.get("expirationDate") else 0
+        name        = c["name"]
+        value       = c["value"]
+        lines.append(
+            f"{domain}\t{subdomain}\t{path}\t{secure}\t{expiry}\t{name}\t{value}"
+        )
+
+    return "\n".join(lines), len(deduped)
+
+
+def _save_netscape_cookie_file(json_bytes: bytes) -> tuple[str, int, str]:
+    """
+    Convert JSON bytes → Netscape string → write to temp file.
+    Returns (temp_file_path, cookie_count, error_message).
+    """
+    try:
+        netscape_str, count = convert_cookies_json_to_netscape(json_bytes)
+        # Write to a named temp file that persists until we delete it
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", delete=False, encoding="utf-8"
+        )
+        tmp.write(netscape_str)
+        tmp.flush()
+        tmp.close()
+        return tmp.name, count, ""
+    except Exception as e:
+        return "", 0, str(e)
+
+
+def _clear_cookie_file():
+    """Delete the on-disk temp file and wipe session state."""
+    path = st.session_state.get("yt_cookie_path")
+    if path and os.path.exists(path):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    st.session_state["yt_cookie_path"] = None
+    st.session_state["yt_cookie_hash"] = ""
+
+# ── YouTube transcript engine ─────────────────────────────────────────────────
 
 @functools.lru_cache(maxsize=64)
 def extract_youtube_id(url: str):
-    """
-    Extract video ID from any YouTube URL format.
-    LRU-cached so repeated calls are instant dict lookups.
-    """
     patterns = [
         r'(?:v=)([\w-]{11})',
         r'(?:youtu\.be/)([\w-]{11})',
@@ -226,37 +360,35 @@ def extract_youtube_id(url: str):
         m = re.search(pattern, url)
         if m:
             return m.group(1)
-    # Bare video ID
     if re.match(r'^[\w-]{11}$', url.strip()):
         return url.strip()
     return None
 
 @st.cache_resource
-def get_youtube_api():
+def get_youtube_api(cookie_path: str = ""):
     """
-    Single YouTubeTranscriptApi instance reused for the app lifetime.
-    Avoids creating a new object on every transcript request.
+    Returns a YouTubeTranscriptApi instance.
+    Keyed on cookie_path so a new authenticated client is created automatically
+    whenever the user uploads a new cookie file.
+
+    cookie_path = ""          → unauthenticated (fallback)
+    cookie_path = "/tmp/..."  → authenticated with user's session cookies
     """
-    if YOUTUBE_AVAILABLE:
-        return YouTubeTranscriptApi()
-    return None
+    if not YOUTUBE_AVAILABLE:
+        return None
+    if cookie_path and os.path.exists(cookie_path):
+        return YouTubeTranscriptApi(cookies=cookie_path)
+    return YouTubeTranscriptApi()
 
 def _scrape_youtube_transcript(video_id: str) -> str:
-    """
-    Multi-stage HTML scrape fallback used when the library is unavailable
-    or when the video is region-restricted for the library but still has
-    a public caption XML endpoint.
-
-    Stage 1 — Native HTML parse (regex on ytInitialPlayerResponse)
-    Stage 2 — Public proxy API (youtubetranscript.com)
-    """
+    """HTML scrape fallback — Stage 1 (direct XML) then Stage 2 (proxy)."""
     headers = {
         "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept-Language": "en-US,en;q=0.9",
     }
     cookies = {"CONSENT": "YES+cb.20210328-17-p0.en+FX+478"}
 
-    # Stage 1 — parse captionTracks from page HTML
+    # Stage 1
     try:
         page_html = requests.get(
             f"https://www.youtube.com/watch?v={video_id}",
@@ -264,15 +396,15 @@ def _scrape_youtube_transcript(video_id: str) -> str:
         ).text
         m = _RE_CAPTIONS.search(page_html)
         if m:
-            xml_url     = json.loads(m.group(1))[0]['baseUrl']
-            xml_resp    = requests.get(xml_url, headers=headers, timeout=10)
-            transcript  = _RE_HTML_TAGS.sub(' ', xml_resp.text)
-            transcript  = html.unescape(transcript)
+            xml_url    = json.loads(m.group(1))[0]['baseUrl']
+            xml_resp   = requests.get(xml_url, headers=headers, timeout=10)
+            transcript = _RE_HTML_TAGS.sub(' ', xml_resp.text)
+            transcript = html.unescape(transcript)
             return _RE_WHITESPACE.sub(' ', transcript).strip()
     except Exception:
         pass
 
-    # Stage 2 — public proxy
+    # Stage 2
     try:
         proxy = requests.get(
             f"https://youtubetranscript.com/?server_vid2={video_id}", timeout=10
@@ -284,35 +416,35 @@ def _scrape_youtube_transcript(video_id: str) -> str:
     except Exception:
         pass
 
-    raise ValueError("All extraction methods failed. The video may not have closed captions.")
+    raise ValueError(
+        "YouTube is blocking transcript access from this server's IP. "
+        "Upload your YouTube cookies.json in the sidebar to authenticate."
+    )
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_youtube_transcript(video_id: str) -> str:
+def get_youtube_transcript(video_id: str, cookie_path: str = "") -> str:
     """
-    Primary transcript engine — results cached 1 hour per video ID.
+    Full 3-plan transcript engine. cookie_path is included in the cache key
+    so switching from unauthenticated → authenticated invalidates the cache.
 
-    Plan A  youtube-transcript-api v1.x (instantiated once via cache_resource)
-              • find_transcript(['en'])  →  first available  →  translate fallback
-              • Uses TextFormatter for clean plain-text output
-    Plan B/C  HTML scrape (_scrape_youtube_transcript)
+    Plan A — youtube-transcript-api v1.x (authenticated if cookie_path set)
+    Plan B — HTML parse of captionTracks XML
+    Plan C — youtubetranscript.com proxy
     """
-    # ── Plan A: youtube-transcript-api v1.x ──────────────────────────────
     if YOUTUBE_AVAILABLE:
         try:
-            ytt             = get_youtube_api()
+            ytt             = get_youtube_api(cookie_path)
             transcript_list = ytt.list(video_id)
             try:
-                transcript = transcript_list.find_transcript(['en'])
+                transcript = transcript_list.find_transcript(["en"])
             except Exception:
-                # No English available — grab whatever is first and translate
                 transcript = next(iter(transcript_list))
             fetched   = transcript.fetch()
             formatter = YTTextFormatter()
             return formatter.format_transcript(fetched)
         except Exception:
-            pass  # fall through to scrape methods
+            pass
 
-    # ── Plan B/C: HTML scrape fallback ───────────────────────────────────
     return _scrape_youtube_transcript(video_id)
 
 # ── Web content ───────────────────────────────────────────────────────────────
@@ -326,7 +458,6 @@ def clean_web_markdown(text):
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_web_content(url: str) -> str:
-    """Fetch and clean web article. Cached 5 minutes — same URL never re-fetched."""
     try:
         resp = requests.get(f"https://r.jina.ai/{url}", timeout=15)
         resp.raise_for_status()
@@ -345,9 +476,28 @@ def fetch_web_content(url: str) -> str:
 
 # ── Gemini ────────────────────────────────────────────────────────────────────
 
+@st.cache_resource
+def get_genai_client(api_key: str):
+    return genai.Client(api_key=api_key)
+
+@st.cache_data(ttl=300, show_spinner=False)
+def validate_api_key(api_key: str) -> bool:
+    if not api_key or len(api_key) < 10:
+        return False
+    try:
+        client = get_genai_client(api_key)
+        next(iter(client.models.list()))
+        return True
+    except Exception:
+        return False
+
+@st.cache_data(
+    show_spinner=False,
+    hash_funcs={Image.Image: lambda img: hashlib.md5(img.tobytes()).hexdigest()}
+)
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
 def generate_flashcards(api_key, text_content, image_content, difficulty, count_val):
-    client        = genai.Client(api_key=api_key)
+    client        = get_genai_client(api_key)
     system_prompt = (
         f"Act as a professor for {difficulty} level students. "
         f"Create {count_val} flashcards strictly based on the core educational content provided. "
@@ -374,11 +524,6 @@ def generate_flashcards(api_key, text_content, image_content, difficulty, count_
 
 @st.cache_data(show_spinner=False)
 def text_to_speech_html(text: str) -> str:
-    """
-    Generate base64 audio HTML for a card.
-    Cached indefinitely — the same card text always produces the same audio,
-    so Google TTS is never called twice for the same string.
-    """
     try:
         clean = _RE_HTML_TAGS.sub('', text)
         tts   = gTTS(text=clean, lang='en')
@@ -392,6 +537,39 @@ def text_to_speech_html(text: str) -> str:
         )
     except Exception:
         return ""
+
+# ── Anki .apkg export ─────────────────────────────────────────────────────────
+
+def export_deck_apkg(deck_name: str, cards_df: pd.DataFrame) -> bytes:
+    model_id  = abs(hash(f"fpro_model_{deck_name}")) % (10 ** 10)
+    deck_id   = abs(hash(f"fpro_deck_{deck_name}"))  % (10 ** 10)
+    model = genanki.Model(
+        model_id, "Flashcard Pro",
+        fields=[{"name": "Front"}, {"name": "Back"}, {"name": "Explanation"}],
+        templates=[{
+            "name": "Card",
+            "qfmt": "<div style='font-size:20px;font-weight:700;'>{{Front}}</div>",
+            "afmt": (
+                "{{FrontSide}}<hr id=answer>"
+                "<div style='font-size:16px;'>{{Back}}</div>"
+                "<div style='font-size:12px;font-style:italic;margin-top:8px;'>{{Explanation}}</div>"
+            ),
+        }]
+    )
+    anki_deck = genanki.Deck(deck_id, deck_name)
+    for _, row in cards_df.iterrows():
+        anki_deck.add_note(genanki.Note(
+            model=model,
+            fields=[str(row.get("front","")), str(row.get("back","")), str(row.get("explanation",""))]
+        ))
+    with tempfile.NamedTemporaryFile(suffix=".apkg", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        genanki.Package(anki_deck).write_to_file(tmp_path)
+        with open(tmp_path, "rb") as f:
+            return f.read()
+    finally:
+        os.unlink(tmp_path)
 
 # ====================== 5. UI COMPONENTS & CSS ======================
 def inject_custom_css():
@@ -427,46 +605,62 @@ def section_generator(api_key):
             if PDF_AVAILABLE:
                 pdf_file = st.file_uploader("Upload PDF Document", type=["pdf"])
                 if pdf_file:
-                    with st.spinner("Extracting..."):
-                        raw_text, error_msg = extract_pdf_text(pdf_file)
-                        if not error_msg:
-                            st.success(f"PDF Extracted! ({len(raw_text)} chars)")
+                    with st.spinner("Extracting…"):
+                        f_hash        = hash_uploaded_file(pdf_file)
+                        raw_text, err = extract_pdf_text(f_hash, pdf_file.getvalue())
+                        if not err:
+                            st.success(f"PDF Extracted! ({len(raw_text):,} chars)")
                             with st.expander("Preview & Edit", expanded=True):
                                 content_text = st.text_area("Edit text:", raw_text, height=200)
                         else:
-                            st.error(error_msg)
+                            st.error(err)
             else:
                 st.warning("Please install 'pypdf'")
 
         elif source_type == "Image Analysis":
             img_file = st.file_uploader("Upload Diagram", type=["png", "jpg", "jpeg"])
             if img_file:
-                image_content = Image.open(img_file)
+                raw_img       = Image.open(img_file)
+                image_content = compress_image(raw_img)
                 st.image(image_content, width=300)
+                orig_px = raw_img.width  * raw_img.height
+                comp_px = image_content.width * image_content.height
+                if orig_px > comp_px:
+                    st.caption(
+                        f"🗜️ Compressed to {image_content.width}×{image_content.height} "
+                        f"({comp_px/orig_px:.0%} of original pixels)"
+                    )
                 content_text = "Generate flashcards based on this image."
 
         elif source_type == "YouTube URL":
             url = st.text_input("Video URL")
             if url:
+                cookie_path = st.session_state.get("yt_cookie_path") or ""
+                if not cookie_path:
+                    st.info(
+                        "💡 No YouTube cookies loaded. If extraction fails, upload your "
+                        "`cookies.json` in the sidebar **🍪 YouTube Cookies** panel.",
+                        icon="ℹ️"
+                    )
                 with st.spinner("Transcribing…"):
                     try:
                         video_id = extract_youtube_id(url)
                         if not video_id:
                             raise ValueError("Invalid YouTube URL.")
-                        # Single call — handles v1.x API + fallback, cached 1 h
-                        raw_text = get_youtube_transcript(video_id)
-                        st.success("✅ Transcript Extracted Successfully!")
+                        raw_text = get_youtube_transcript(video_id, cookie_path)
+                        auth_label = "🔐 authenticated" if cookie_path else "🌐 unauthenticated"
+                        st.success(f"✅ Transcript extracted ({auth_label})")
                         with st.expander("Preview & Edit Transcript", expanded=True):
                             content_text = st.text_area(
                                 "Edit text before generating:", raw_text, height=200
                             )
                     except Exception as e:
-                        st.error(f"Error extracting transcript: {str(e)}")
+                        st.error(f"Transcript error: {str(e)}")
 
         elif source_type == "Web Article":
             url = st.text_input("Article URL")
             if url:
-                with st.spinner("Fetching Webpage..."):
+                with st.spinner("Fetching Webpage…"):
                     try:
                         raw_text = fetch_web_content(url)
                         st.success("Web Content Extracted!")
@@ -481,13 +675,24 @@ def section_generator(api_key):
         difficulty = st.select_slider("Level", ["Beginner", "Intermediate", "Expert"], value="Intermediate")
         qty        = st.number_input("Count", 1, 30, 10)
 
-        if st.button("🚀 Generate via AI", type="primary", use_container_width=True):
+        calls_today = _get_api_budget_count()
+        st.progress(min(calls_today / _API_DAILY_LIMIT, 1.0))
+        if calls_today >= _API_DAILY_LIMIT:
+            st.error(f"🚫 Daily limit reached ({calls_today}/{_API_DAILY_LIMIT})")
+        elif calls_today >= _API_WARN_AT:
+            st.warning(f"⚠️ API calls today: {calls_today}/{_API_DAILY_LIMIT}")
+        else:
+            st.caption(f"✅ API calls today: {calls_today}/{_API_DAILY_LIMIT}")
+        st.write("")
+
+        budget_exhausted = calls_today >= _API_DAILY_LIMIT
+
+        if st.button("🚀 Generate via AI", type="primary", use_container_width=True,
+                     disabled=budget_exhausted):
             if not api_key:                         st.error("API Key Missing");          return
             if not (content_text or image_content): st.warning("No valid content");       return
             if not deck_name:                       st.error("Please enter a Deck Name"); return
 
-            # ── Smart Rate-Limit Guard ────────────────────────────────────
-            # Calculates the EXACT remaining wait — never sleeps more than needed.
             elapsed     = time.perf_counter() - st.session_state["last_api_call_ts"]
             wait_needed = max(0.0, _API_MIN_INTERVAL - elapsed)
 
@@ -503,6 +708,7 @@ def section_generator(api_key):
                     st.session_state["last_api_call_ts"] = time.perf_counter()
                     cards  = generate_flashcards(api_key, content_text, image_content, difficulty, qty)
                     api_ms = (time.perf_counter() - t_api) * 1000
+                    _increment_api_budget()
 
                     st.write(f"✅ Gemini responded in {api_ms:.0f} ms")
                     st.write("💾 Saving to database…")
@@ -520,8 +726,8 @@ def section_generator(api_key):
                             ).fetchone()[0]
                             data = [
                                 (deck_id,
-                                 clean_text(card['front']),
-                                 clean_text(card['back']),
+                                 _RE_BOLD.sub(r'<b>\1</b>', card['front']).strip(),
+                                 _RE_BOLD.sub(r'<b>\1</b>', card['back']).strip(),
                                  card.get('explanation', ''),
                                  card['tag'])
                                 for card in cards
@@ -612,7 +818,6 @@ def section_study():
         st.session_state["current_deck_id"] = deck_id
         with get_db_connection() as conn:
             if st.session_state["cram_mode"]:
-                # ── Select only the 5 fields we actually render ───────────
                 cards = conn.execute(
                     "SELECT id, front, back, explanation, tag FROM cards WHERE deck_id=? ORDER BY RANDOM() LIMIT 50",
                     (deck_id,)
@@ -623,23 +828,14 @@ def section_study():
                     "WHERE deck_id=? AND next_review<=? ORDER BY next_review ASC LIMIT 50",
                     (deck_id, datetime.now().strftime("%Y-%m-%d"))
                 ).fetchall()
-
-        # ── Session-state pruning: only store fields needed for rendering ──
         st.session_state["study_queue"] = [
-            {
-                "id":          c["id"],
-                "front":       c["front"],
-                "back":        c["back"],
-                "explanation": c["explanation"],
-                "tag":         c["tag"],
-            }
+            {"id": c["id"], "front": c["front"], "back": c["back"],
+             "explanation": c["explanation"], "tag": c["tag"]}
             for c in cards
         ]
         st.session_state["study_index"]   = 0
         st.session_state["show_answer"]   = False
-        st.session_state["session_stats"] = {
-            "reviewed": 0, "correct": 0, "start_time": time.time()
-        }
+        st.session_state["session_stats"] = {"reviewed": 0, "correct": 0, "start_time": time.time()}
 
     queue, idx = st.session_state["study_queue"], st.session_state["study_index"]
     if not queue:
@@ -651,8 +847,8 @@ def section_study():
 
         audio_html, back_content, explanation_html = "", "<span style='opacity:0.6;'>(Think…)</span>", ""
         if st.session_state["show_answer"]:
-            back_content  = card['back']
-            audio_html    = text_to_speech_html(card['front'] + " ... " + card['back'])
+            back_content = card['back']
+            audio_html   = text_to_speech_html(card['front'] + " ... " + card['back'])
             if card.get("explanation"):
                 explanation_html = f'<div class="card-explanation">💡 {card["explanation"]}</div>'
 
@@ -691,101 +887,199 @@ def section_study():
 
 def section_library():
     st.header("📚 Library")
-    # ── Single DB round-trip for all library data ─────────────────────────
     with get_db_connection() as conn:
-        df_cards = pd.read_sql("SELECT * FROM cards", conn)
-        decks    = pd.read_sql("SELECT * FROM decks", conn)
-
+        decks = pd.read_sql("SELECT id, name, created_at FROM decks", conn)
     if decks.empty:
         st.info("No decks."); return
 
     t1, t2, t3, t4 = st.tabs(["📊 Stats", "✏️ Edit Cards", "📤 Export", "🗑️ Manage"])
 
     with t1:
-        if not df_cards.empty:
-            df_merged = pd.merge(
-                df_cards, decks,
-                left_on="deck_id", right_on="id",
-                suffixes=('_card', '_deck')
+        with get_db_connection() as conn:
+            df_stats = pd.read_sql(
+                "SELECT id, deck_id, repetitions, ease_factor, last_reviewed FROM cards", conn
             )
-            stats_df = df_merged.groupby("name").agg(
+        if not df_stats.empty:
+            df_merged = pd.merge(df_stats, decks, left_on="deck_id", right_on="id", suffixes=('_card','_deck'))
+            summary   = df_merged.groupby("name").agg(
                 {"repetitions": "mean", "ease_factor": "mean", "id_card": "count"}
             ).rename(columns={"id_card": "Total Cards", "repetitions": "Avg Reps", "ease_factor": "Avg Ease"})
-            st.dataframe(stats_df, use_container_width=True)
-            if df_cards['last_reviewed'].notna().any():
-                df_cards['last_reviewed'] = pd.to_datetime(df_cards['last_reviewed']).dt.date
-                activity = df_cards['last_reviewed'].value_counts().reset_index()
-                activity.columns = ['date', 'count']
+            st.dataframe(summary, use_container_width=True)
+            if df_stats['last_reviewed'].notna().any():
+                df_stats['last_reviewed'] = pd.to_datetime(df_stats['last_reviewed']).dt.date
+                activity                  = df_stats['last_reviewed'].value_counts().reset_index()
+                activity.columns          = ['date', 'count']
                 st.altair_chart(
-                    alt.Chart(activity).mark_rect().encode(
-                        x='date:O', y='count:Q', color='count'
-                    ),
+                    alt.Chart(activity).mark_rect().encode(x='date:O', y='count:Q', color='count'),
                     use_container_width=True
                 )
 
     with t2:
-        if not df_cards.empty:
-            edited = st.data_editor(
-                df_cards[['id', 'front', 'back', 'explanation', 'tag']],
-                hide_index=True, use_container_width=True, disabled=["id"]
+        selected_edit_deck = st.selectbox("Select deck to edit", decks['name'].tolist(), key="edit_deck_sel")
+        sel_deck_id        = int(decks[decks['name'] == selected_edit_deck].iloc[0]['id'])
+        with get_db_connection() as conn:
+            df_edit = pd.read_sql(
+                "SELECT id, front, back, explanation, tag FROM cards WHERE deck_id=?",
+                conn, params=(sel_deck_id,)
             )
-            if st.button("💾 Save to DB", type="primary"):
-                # ── Batch executemany — replaces N individual UPDATE calls ──
-                data = [
-                    (r['front'], r['back'], r['explanation'], r['tag'], r['id'])
-                    for _, r in edited.iterrows()
-                ]
-                with get_db_connection() as conn:
-                    conn.executemany(
-                        "UPDATE cards SET front=?, back=?, explanation=?, tag=? WHERE id=?",
-                        data
+        if df_edit.empty:
+            st.info("No cards in this deck yet.")
+        else:
+            df_edit.insert(0, "delete", False)
+            edited = st.data_editor(
+                df_edit, hide_index=True, use_container_width=True, disabled=["id"],
+                column_config={
+                    "delete": st.column_config.CheckboxColumn(
+                        "🗑️", help="Check rows to mark for deletion", default=False, width="small"
                     )
-                    conn.commit()
-                st.success("Updated!")
+                }
+            )
+            col_save, col_del = st.columns(2)
+            with col_save:
+                if st.button("💾 Save Changes", type="primary", use_container_width=True):
+                    rows_to_save = edited[edited["delete"] == False]
+                    data = [(r['front'], r['back'], r['explanation'], r['tag'], r['id'])
+                            for _, r in rows_to_save.iterrows()]
+                    with get_db_connection() as conn:
+                        conn.executemany(
+                            "UPDATE cards SET front=?, back=?, explanation=?, tag=? WHERE id=?", data
+                        )
+                        conn.commit()
+                    st.success(f"Saved {len(data)} cards!")
+            with col_del:
+                ids_to_delete = edited[edited["delete"] == True]['id'].tolist()
+                if ids_to_delete:
+                    if st.button(f"🗑️ Delete {len(ids_to_delete)} card(s)", type="secondary", use_container_width=True):
+                        delete_cards_by_ids(ids_to_delete)
+                        st.toast(f"🗑️ Deleted {len(ids_to_delete)} card(s).")
+                        st.rerun()
+                else:
+                    st.button("🗑️ Delete Selected", disabled=True, use_container_width=True)
 
     with t3:
-        export_deck = st.selectbox("Export Deck", decks['name'].tolist())
-        deck_id_raw = decks[decks['name'] == export_deck].iloc[0]['id']
+        export_deck = st.selectbox("Export Deck", decks['name'].tolist(), key="exp_sel")
+        exp_deck_id = int(decks[decks['name'] == export_deck].iloc[0]['id'])
         with get_db_connection() as conn:
             cards_df = pd.read_sql(
-                "SELECT front, back, tag FROM cards WHERE deck_id=?",
-                conn, params=(int(deck_id_raw),)
+                "SELECT front, back, explanation, tag FROM cards WHERE deck_id=?",
+                conn, params=(exp_deck_id,)
             )
-        st.download_button(
-            "Download CSV",
-            data=(
-                cards_df.to_csv(index=False, header=False).encode('utf-8')
-                if not cards_df.empty else b""
-            ),
-            file_name=f"{export_deck}.csv",
-            disabled=cards_df.empty
-        )
+        col_csv, col_apkg = st.columns(2)
+        with col_csv:
+            st.download_button(
+                "📄 Download CSV",
+                data=(cards_df[['front','back','tag']].to_csv(index=False, header=False).encode('utf-8')
+                      if not cards_df.empty else b""),
+                file_name=f"{export_deck}.csv",
+                disabled=cards_df.empty, use_container_width=True
+            )
+        with col_apkg:
+            if GENANKI_AVAILABLE:
+                if not cards_df.empty:
+                    st.download_button(
+                        "📦 Download .apkg (Anki)",
+                        data=export_deck_apkg(export_deck, cards_df),
+                        file_name=f"{export_deck}.apkg",
+                        mime="application/octet-stream", use_container_width=True
+                    )
+                else:
+                    st.button("📦 Download .apkg (Anki)", disabled=True, use_container_width=True)
+            else:
+                st.caption("Install `genanki` to enable Anki export.")
 
     with t4:
         c1, c2 = st.columns(2)
         with c1:
-            ren   = st.selectbox("Rename", decks['name'].tolist(), key="r_sel")
-            new_n = st.text_input("New Name")
-            if st.button("Rename") and new_n:
+            st.subheader("Rename Deck")
+            ren   = st.selectbox("Select deck", decks['name'].tolist(), key="r_sel")
+            new_n = st.text_input("New name")
+            if st.button("✏️ Rename", use_container_width=True) and new_n:
                 if rename_deck(ren, new_n):
-                    st.toast("✅ Deck renamed successfully!")  # replaces time.sleep(1)
+                    st.toast(f'✅ Renamed to "{new_n}"')
                     st.rerun()
                 else:
-                    st.error("Name already exists.")
+                    st.error("That name already exists.")
         with c2:
-            d_del = st.selectbox("Delete", decks['name'].tolist(), key="d_sel")
-            if st.button(f"🗑️ Delete {d_del}"):
+            st.subheader("Delete Deck")
+            d_del      = st.selectbox("Select deck to delete", decks['name'].tolist(), key="d_sel")
+            with get_db_connection() as conn:
+                row        = conn.execute(
+                    "SELECT COUNT(*) FROM cards WHERE deck_id=(SELECT id FROM decks WHERE name=?)", (d_del,)
+                ).fetchone()
+                card_count = row[0] if row else 0
+            st.warning(f'Deleting **"{d_del}"** will permanently remove the deck and all **{card_count} card(s)**.')
+            confirmed = st.checkbox(f'Yes, permanently delete "{d_del}"', key=f"del_confirm_{d_del}")
+            if st.button("🗑️ Delete Deck", disabled=not confirmed,
+                         type="primary" if confirmed else "secondary",
+                         use_container_width=True) and confirmed:
                 delete_deck(d_del)
+                st.toast(f'🗑️ "{d_del}" deleted.')
                 st.rerun()
 
 # ====================== 7. MAIN ======================
 
 def main():
     inject_custom_css()
+
+    if not st.session_state["_db_initialized"]:
+        migrated = init_db()
+        st.session_state["_db_initialized"] = True
+        if migrated:
+            st.toast("🔧 Database schema updated.")
+
     with st.sidebar:
         st.title("🧠 Flashcard Pro")
+
+        # ── Gemini API key ────────────────────────────────────────────────
         api_key = st.text_input("Gemini API Key", type="password")
+        if api_key:
+            st.caption("✅ API key valid" if validate_api_key(api_key) else "❌ Invalid API key")
+
         st.metric("Cards Due Today", get_due_cards_count())
+        st.divider()
+
+        # ── YouTube Cookies panel ─────────────────────────────────────────
+        cookie_path   = st.session_state.get("yt_cookie_path") or ""
+        cookie_active = bool(cookie_path and os.path.exists(cookie_path))
+
+        with st.expander(
+            "🔐 YouTube Cookies  ✅" if cookie_active else "🍪 YouTube Cookies",
+            expanded=not cookie_active
+        ):
+            if cookie_active:
+                st.success("Cookies active — transcripts are authenticated.")
+                if st.button("🗑️ Clear Cookies", use_container_width=True, key="clear_yt_cookies"):
+                    _clear_cookie_file()
+                    st.toast("🍪 Cookies cleared.")
+                    st.rerun()
+            else:
+                st.caption(
+                    "If YouTube blocks transcript fetching, upload your `cookies.json` "
+                    "exported from **Cookie-Editor** (Chrome/Firefox extension)."
+                )
+                cookie_upload = st.file_uploader(
+                    "Upload cookies.json", type=["json"], key="yt_cookie_upload",
+                    label_visibility="collapsed"
+                )
+                if cookie_upload:
+                    file_hash = hashlib.md5(cookie_upload.getvalue()).hexdigest()
+                    # Only re-process if this is a new file
+                    if file_hash != st.session_state.get("yt_cookie_hash", ""):
+                        with st.spinner("Converting cookies…"):
+                            path, count, err = _save_netscape_cookie_file(cookie_upload.getvalue())
+                        if err:
+                            st.error(f"❌ Parse error: {err}")
+                        else:
+                            # Clean up previous temp file before storing new one
+                            old_path = st.session_state.get("yt_cookie_path")
+                            if old_path and os.path.exists(old_path):
+                                try: os.unlink(old_path)
+                                except OSError: pass
+                            st.session_state["yt_cookie_path"] = path
+                            st.session_state["yt_cookie_hash"] = file_hash
+                            st.success(f"✅ {count} cookies loaded.")
+                            st.rerun()
+
         st.divider()
         page = st.radio(
             "Navigation",
