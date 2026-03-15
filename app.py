@@ -305,7 +305,7 @@ def convert_cookies_json_to_netscape(json_bytes: bytes) -> tuple[str, int]:
         subdomain   = "TRUE" if domain.startswith(".") else "FALSE"
         path        = c.get("path", "/")
         secure      = "TRUE" if c.get("secure", False) else "FALSE"
-        # session=true means no persistent expiry → use 0
+        # session=true means no persistent expiry -> use 0
         expiry      = int(float(c["expirationDate"])) if c.get("expirationDate") else 0
         name        = c["name"]
         value       = c["value"]
@@ -318,7 +318,7 @@ def convert_cookies_json_to_netscape(json_bytes: bytes) -> tuple[str, int]:
 
 def _save_netscape_cookie_file(json_bytes: bytes) -> tuple[str, int, str]:
     """
-    Convert JSON bytes → Netscape string → write to temp file.
+    Convert JSON bytes -> Netscape string -> write to temp file.
     Returns (temp_file_path, cookie_count, error_message).
     """
     try:
@@ -371,8 +371,8 @@ def get_youtube_api(cookie_path: str = ""):
     Keyed on cookie_path so a new authenticated client is created automatically
     whenever the user uploads a new cookie file.
 
-    cookie_path = ""          → unauthenticated (fallback)
-    cookie_path = "/tmp/..."  → authenticated with user's session cookies
+    cookie_path = ""          -> unauthenticated (fallback)
+    cookie_path = "/tmp/..."  -> authenticated with user's session cookies
     """
     if not YOUTUBE_AVAILABLE:
         return None
@@ -425,7 +425,7 @@ def _scrape_youtube_transcript(video_id: str) -> str:
 def get_youtube_transcript(video_id: str, cookie_path: str = "") -> str:
     """
     Full 3-plan transcript engine. cookie_path is included in the cache key
-    so switching from unauthenticated → authenticated invalidates the cache.
+    so switching from unauthenticated -> authenticated invalidates the cache.
 
     Plan A — youtube-transcript-api v1.x (authenticated if cookie_path set)
     Plan B — HTML parse of captionTracks XML
