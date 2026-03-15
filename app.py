@@ -11,9 +11,7 @@ import io
 import base64
 import os
 import html
-import hashlib
 import functools
-import tempfile
 from datetime import datetime, timedelta
 import altair as alt
 
@@ -40,6 +38,7 @@ try:
 except ImportError:
     BS4_AVAILABLE = False
 
+# ── YouTube: v1.x API with formatters & exception classes ────────────────────
 try:
     from youtube_transcript_api import (
         YouTubeTranscriptApi,
@@ -57,13 +56,8 @@ try:
 except ImportError:
     PDF_AVAILABLE = False
 
-try:
-    import genanki
-    GENANKI_AVAILABLE = True
-except ImportError:
-    GENANKI_AVAILABLE = False
-
 # ====================== PRE-COMPILED REGEX PATTERNS ======================
+# Compiled once at import time — never recompiled per-call
 _RE_BOLD            = re.compile(r'\*\*(.*?)\*\*')
 _RE_CODE_FENCE_JSON = re.compile(r'^```json', re.MULTILINE)
 _RE_CODE_FENCE      = re.compile(r'^```',     re.MULTILINE)
@@ -76,10 +70,8 @@ _RE_MULTILINE       = re.compile(r'\n\s*\n')
 _RE_CAPTIONS        = re.compile(r'"captionTracks"\s*:\s*(\[.*?\])')
 _RE_ACCESS_DENIED   = re.compile(r'Access Denied|edgesuite\.net|Reference #')
 
-# ====================== API RATE-LIMIT & BUDGET CONSTANTS ======================
+# ====================== API RATE-LIMIT CONSTANTS ======================
 _API_MIN_INTERVAL = 12.0   # seconds — enforces 5 RPM (Free Tier)
-_API_DAILY_LIMIT  = 20     # RPD hard cap (Free Tier)
-_API_WARN_AT      = 18     # Show warning at this count
 
 # ====================== SESSION STATE DEFAULTS ======================
 DEFAULT_STATE = {
@@ -89,9 +81,7 @@ DEFAULT_STATE = {
     "show_answer":      False,
     "session_stats":    {"reviewed": 0, "correct": 0, "start_time": None},
     "cram_mode":        False,
-    "last_api_call_ts": 0.0,
-    "api_budget":       {"date": datetime.now().strftime("%Y-%m-%d"), "count": 0},
-    "_db_initialized":  False,
+    "last_api_call_ts": 0.0,   # time.perf_counter() of last Gemini call
 }
 
 for key, value in DEFAULT_STATE.items():
@@ -102,29 +92,15 @@ for key, value in DEFAULT_STATE.items():
 DB_NAME = "flashcards_v5.db"
 
 def get_db_connection():
-    """
-    Opens a SQLite connection with:
-      WAL mode        — concurrent reads during writes
-      8 MB page cache — reduces I/O on repeated reads
-      NORMAL sync     — safe with WAL, ~2x faster writes
-      MEMORY temp     — sort buffers stay in RAM (faster ORDER BY / GROUP BY)
-      256 MB mmap     — bypasses OS file cache layer on large DBs
-    """
+    """Open a SQLite connection with WAL, 8 MB read cache, and NORMAL sync."""
     conn = sqlite3.connect(DB_NAME, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA cache_size=-8000;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    conn.execute("PRAGMA temp_store=MEMORY;")        # Cat B #5
-    conn.execute("PRAGMA mmap_size=268435456;")      # Cat B #6 — 256 MB
+    conn.execute("PRAGMA cache_size=-8000;")     # 8 MB page cache
+    conn.execute("PRAGMA synchronous=NORMAL;")   # Safe with WAL; ~2× faster writes
     return conn
 
-def init_db() -> bool:
-    """
-    Initialize schema and indexes. Returns True if any migration was applied.
-    Called once per session via session_state guard in main(). Cat D #22
-    """
-    migrated = False
+def init_db():
     with get_db_connection() as conn:
         c = conn.cursor()
         c.execute('''CREATE TABLE IF NOT EXISTS decks (
@@ -146,21 +122,20 @@ def init_db() -> bool:
             last_reviewed TEXT,
             FOREIGN KEY(deck_id) REFERENCES decks(id) ON DELETE CASCADE)''')
 
-        try:
-            c.execute("SELECT explanation FROM cards LIMIT 1")
+        # Schema migration guards
+        try:    c.execute("SELECT explanation FROM cards LIMIT 1")
         except sqlite3.OperationalError:
             c.execute("ALTER TABLE cards ADD COLUMN explanation TEXT DEFAULT ''")
-            migrated = True
-        try:
-            c.execute("SELECT last_reviewed FROM cards LIMIT 1")
+        try:    c.execute("SELECT last_reviewed FROM cards LIMIT 1")
         except sqlite3.OperationalError:
             c.execute("ALTER TABLE cards ADD COLUMN last_reviewed TEXT")
-            migrated = True
 
+        # ── Performance indexes (idempotent) ─────────────────────────────
         c.execute("CREATE INDEX IF NOT EXISTS idx_cards_deck_review ON cards(deck_id, next_review)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_cards_deck_id    ON cards(deck_id)")
         conn.commit()
-    return migrated
+
+init_db()
 
 # ====================== 3. CORE LOGIC ======================
 def update_card_sm2(card_id, quality):
@@ -189,15 +164,6 @@ def delete_deck(deck_name):
         conn.execute("DELETE FROM decks WHERE name=?", (deck_name,))
         conn.commit()
 
-def delete_cards_by_ids(card_ids: list):
-    """Batch-delete individual cards by ID list. Cat B #21"""
-    if not card_ids:
-        return
-    placeholders = ",".join("?" * len(card_ids))
-    with get_db_connection() as conn:
-        conn.execute(f"DELETE FROM cards WHERE id IN ({placeholders})", card_ids)
-        conn.commit()
-
 def rename_deck(old_name, new_name):
     try:
         with get_db_connection() as conn:
@@ -209,27 +175,12 @@ def rename_deck(old_name, new_name):
 
 @st.cache_data(ttl=30, show_spinner=False)
 def get_due_cards_count():
+    """Cached for 30 s — prevents a DB query on every single UI interaction."""
     today = datetime.now().strftime("%Y-%m-%d")
     with get_db_connection() as conn:
         return conn.execute(
             "SELECT COUNT(*) FROM cards WHERE next_review <= ?", (today,)
         ).fetchone()[0]
-
-def _increment_api_budget():
-    """Track daily API usage. Resets automatically on date change. Cat C #4"""
-    today  = datetime.now().strftime("%Y-%m-%d")
-    budget = st.session_state["api_budget"]
-    if budget["date"] != today:
-        st.session_state["api_budget"] = {"date": today, "count": 0}
-    st.session_state["api_budget"]["count"] += 1
-
-def _get_api_budget_count() -> int:
-    today  = datetime.now().strftime("%Y-%m-%d")
-    budget = st.session_state["api_budget"]
-    if budget["date"] != today:
-        st.session_state["api_budget"] = {"date": today, "count": 0}
-        return 0
-    return budget["count"]
 
 # ====================== 4. AI CONTENT ENGINE & EXTRACTORS ======================
 class Flashcard(BaseModel):
@@ -249,48 +200,22 @@ def sanitize_json(text):
     text = _RE_CODE_FENCE_JSON.sub('', text)
     return _RE_CODE_FENCE.sub('', text).strip()
 
-# ── PDF extraction — early exit + caching ─────────────────────────────────────
-
-@st.cache_data(show_spinner=False)
-def extract_pdf_text(file_hash: str, file_bytes: bytes):
-    """
-    Cat B #15: Early exit stops reading pages once 25,000 chars are accumulated.
-    Cat B #17: Cached on file_hash so re-uploading the same PDF returns instantly.
-    """
+def extract_pdf_text(uploaded_file):
     try:
-        reader = PdfReader(io.BytesIO(file_bytes))
-        chunks, total = [], 0
-        for page in reader.pages:
-            page_text = (page.extract_text() or "") + "\n"
-            chunks.append(page_text)
-            total += len(page_text)
-            if total >= 25_000:   # stop as soon as we have enough — no wasted parsing
-                break
-        return "".join(chunks)[:25_000], None
+        reader = PdfReader(io.BytesIO(uploaded_file.getvalue()))
+        text   = "".join((page.extract_text() or "") + "\n" for page in reader.pages)
+        return text[:25000], None
     except Exception as e:
         return None, f"Error reading PDF: {str(e)}"
-
-def hash_uploaded_file(uploaded_file) -> str:
-    return hashlib.md5(uploaded_file.getvalue()).hexdigest()
-
-# ── Image compression ─────────────────────────────────────────────────────────
-
-def compress_image(img: Image.Image, max_px: int = 1024, quality: int = 85) -> Image.Image:
-    """
-    Cat C #16: Resize to max 1024px longest side + ensure RGB.
-    Cuts Gemini upload payload 5-20x on high-res images.
-    """
-    ratio = min(max_px / max(img.width, img.height), 1.0)
-    if ratio < 1.0:
-        img = img.resize((int(img.width * ratio), int(img.height * ratio)), Image.LANCZOS)
-    if img.mode in ("RGBA", "P", "LA"):
-        img = img.convert("RGB")
-    return img
 
 # ── YouTube helpers ───────────────────────────────────────────────────────────
 
 @functools.lru_cache(maxsize=64)
 def extract_youtube_id(url: str):
+    """
+    Extract video ID from any YouTube URL format.
+    LRU-cached so repeated calls are instant dict lookups.
+    """
     patterns = [
         r'(?:v=)([\w-]{11})',
         r'(?:youtu\.be/)([\w-]{11})',
@@ -301,22 +226,37 @@ def extract_youtube_id(url: str):
         m = re.search(pattern, url)
         if m:
             return m.group(1)
+    # Bare video ID
     if re.match(r'^[\w-]{11}$', url.strip()):
         return url.strip()
     return None
 
 @st.cache_resource
 def get_youtube_api():
+    """
+    Single YouTubeTranscriptApi instance reused for the app lifetime.
+    Avoids creating a new object on every transcript request.
+    """
     if YOUTUBE_AVAILABLE:
         return YouTubeTranscriptApi()
     return None
 
 def _scrape_youtube_transcript(video_id: str) -> str:
+    """
+    Multi-stage HTML scrape fallback used when the library is unavailable
+    or when the video is region-restricted for the library but still has
+    a public caption XML endpoint.
+
+    Stage 1 — Native HTML parse (regex on ytInitialPlayerResponse)
+    Stage 2 — Public proxy API (youtubetranscript.com)
+    """
     headers = {
         "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept-Language": "en-US,en;q=0.9",
     }
     cookies = {"CONSENT": "YES+cb.20210328-17-p0.en+FX+478"}
+
+    # Stage 1 — parse captionTracks from page HTML
     try:
         page_html = requests.get(
             f"https://www.youtube.com/watch?v={video_id}",
@@ -324,13 +264,15 @@ def _scrape_youtube_transcript(video_id: str) -> str:
         ).text
         m = _RE_CAPTIONS.search(page_html)
         if m:
-            xml_url    = json.loads(m.group(1))[0]['baseUrl']
-            xml_resp   = requests.get(xml_url, headers=headers, timeout=10)
-            transcript = _RE_HTML_TAGS.sub(' ', xml_resp.text)
-            transcript = html.unescape(transcript)
+            xml_url     = json.loads(m.group(1))[0]['baseUrl']
+            xml_resp    = requests.get(xml_url, headers=headers, timeout=10)
+            transcript  = _RE_HTML_TAGS.sub(' ', xml_resp.text)
+            transcript  = html.unescape(transcript)
             return _RE_WHITESPACE.sub(' ', transcript).strip()
     except Exception:
         pass
+
+    # Stage 2 — public proxy
     try:
         proxy = requests.get(
             f"https://youtubetranscript.com/?server_vid2={video_id}", timeout=10
@@ -341,10 +283,20 @@ def _scrape_youtube_transcript(video_id: str) -> str:
             return _RE_WHITESPACE.sub(' ', transcript).strip()
     except Exception:
         pass
+
     raise ValueError("All extraction methods failed. The video may not have closed captions.")
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_youtube_transcript(video_id: str) -> str:
+    """
+    Primary transcript engine — results cached 1 hour per video ID.
+
+    Plan A  youtube-transcript-api v1.x (instantiated once via cache_resource)
+              • find_transcript(['en'])  →  first available  →  translate fallback
+              • Uses TextFormatter for clean plain-text output
+    Plan B/C  HTML scrape (_scrape_youtube_transcript)
+    """
+    # ── Plan A: youtube-transcript-api v1.x ──────────────────────────────
     if YOUTUBE_AVAILABLE:
         try:
             ytt             = get_youtube_api()
@@ -352,12 +304,15 @@ def get_youtube_transcript(video_id: str) -> str:
             try:
                 transcript = transcript_list.find_transcript(['en'])
             except Exception:
+                # No English available — grab whatever is first and translate
                 transcript = next(iter(transcript_list))
             fetched   = transcript.fetch()
             formatter = YTTextFormatter()
             return formatter.format_transcript(fetched)
         except Exception:
-            pass
+            pass  # fall through to scrape methods
+
+    # ── Plan B/C: HTML scrape fallback ───────────────────────────────────
     return _scrape_youtube_transcript(video_id)
 
 # ── Web content ───────────────────────────────────────────────────────────────
@@ -371,6 +326,7 @@ def clean_web_markdown(text):
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_web_content(url: str) -> str:
+    """Fetch and clean web article. Cached 5 minutes — same URL never re-fetched."""
     try:
         resp = requests.get(f"https://r.jina.ai/{url}", timeout=15)
         resp.raise_for_status()
@@ -387,47 +343,11 @@ def fetch_web_content(url: str) -> str:
             s.decompose()
         return " ".join(soup.stripped_strings)[:25000]
 
-# ── Gemini client — cached for app lifetime ───────────────────────────────────
+# ── Gemini ────────────────────────────────────────────────────────────────────
 
-@st.cache_resource
-def get_genai_client(api_key: str):
-    """
-    Cat C #2: Single genai.Client per API key, reused across all Generate
-    clicks and tenacity retries. Eliminates client reconstruction overhead.
-    """
-    return genai.Client(api_key=api_key)
-
-# ── API key validation ────────────────────────────────────────────────────────
-
-@st.cache_data(ttl=300, show_spinner=False)
-def validate_api_key(api_key: str) -> bool:
-    """
-    Cat C #13: Calls models.list() — no tokens consumed.
-    Cached 5 min — does not re-fire on every UI interaction.
-    """
-    if not api_key or len(api_key) < 10:
-        return False
-    try:
-        client = get_genai_client(api_key)
-        next(iter(client.models.list()))
-        return True
-    except Exception:
-        return False
-
-# ── Flashcard generation — cached + retry ────────────────────────────────────
-
-@st.cache_data(
-    show_spinner=False,
-    hash_funcs={Image.Image: lambda img: hashlib.md5(img.tobytes()).hexdigest()}
-)
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
 def generate_flashcards(api_key, text_content, image_content, difficulty, count_val):
-    """
-    Cat C #3: Cached on (text, image_hash, difficulty, count_val).
-    Re-clicking Generate on identical content returns from cache — zero API call.
-    Outer @st.cache_data wraps inner @retry so retries only fire on cache miss.
-    """
-    client        = get_genai_client(api_key)
+    client        = genai.Client(api_key=api_key)
     system_prompt = (
         f"Act as a professor for {difficulty} level students. "
         f"Create {count_val} flashcards strictly based on the core educational content provided. "
@@ -450,10 +370,15 @@ def generate_flashcards(api_key, text_content, image_content, difficulty, count_
     )
     return json.loads(sanitize_json(response.text)).get("cards", [])
 
-# ── TTS — cached indefinitely ─────────────────────────────────────────────────
+# ── TTS ───────────────────────────────────────────────────────────────────────
 
 @st.cache_data(show_spinner=False)
 def text_to_speech_html(text: str) -> str:
+    """
+    Generate base64 audio HTML for a card.
+    Cached indefinitely — the same card text always produces the same audio,
+    so Google TTS is never called twice for the same string.
+    """
     try:
         clean = _RE_HTML_TAGS.sub('', text)
         tts   = gTTS(text=clean, lang='en')
@@ -467,55 +392,6 @@ def text_to_speech_html(text: str) -> str:
         )
     except Exception:
         return ""
-
-# ── Anki .apkg export ─────────────────────────────────────────────────────────
-
-def export_deck_apkg(deck_name: str, cards_df: pd.DataFrame) -> bytes:
-    """
-    Cat B #14: Generates a .apkg file for direct Anki desktop import.
-    Stable model/deck IDs derived from deck name hash — consistent across exports.
-    """
-    model_id  = abs(hash(f"fpro_model_{deck_name}")) % (10 ** 10)
-    deck_id   = abs(hash(f"fpro_deck_{deck_name}"))  % (10 ** 10)
-
-    model = genanki.Model(
-        model_id,
-        "Flashcard Pro",
-        fields=[
-            {"name": "Front"},
-            {"name": "Back"},
-            {"name": "Explanation"},
-        ],
-        templates=[{
-            "name": "Card",
-            "qfmt": "<div style='font-size:20px;font-weight:700;'>{{Front}}</div>",
-            "afmt": (
-                "{{FrontSide}}<hr id=answer>"
-                "<div style='font-size:16px;'>{{Back}}</div>"
-                "<div style='font-size:12px;font-style:italic;margin-top:8px;'>{{Explanation}}</div>"
-            ),
-        }]
-    )
-
-    anki_deck = genanki.Deck(deck_id, deck_name)
-    for _, row in cards_df.iterrows():
-        anki_deck.add_note(genanki.Note(
-            model=model,
-            fields=[
-                str(row.get("front",       "")),
-                str(row.get("back",        "")),
-                str(row.get("explanation", "")),
-            ]
-        ))
-
-    with tempfile.NamedTemporaryFile(suffix=".apkg", delete=False) as tmp:
-        tmp_path = tmp.name
-    try:
-        genanki.Package(anki_deck).write_to_file(tmp_path)
-        with open(tmp_path, "rb") as f:
-            return f.read()
-    finally:
-        os.unlink(tmp_path)
 
 # ====================== 5. UI COMPONENTS & CSS ======================
 def inject_custom_css():
@@ -551,31 +427,22 @@ def section_generator(api_key):
             if PDF_AVAILABLE:
                 pdf_file = st.file_uploader("Upload PDF Document", type=["pdf"])
                 if pdf_file:
-                    with st.spinner("Extracting…"):
-                        f_hash             = hash_uploaded_file(pdf_file)
-                        raw_text, err      = extract_pdf_text(f_hash, pdf_file.getvalue())
-                        if not err:
-                            st.success(f"PDF Extracted! ({len(raw_text):,} chars)")
+                    with st.spinner("Extracting..."):
+                        raw_text, error_msg = extract_pdf_text(pdf_file)
+                        if not error_msg:
+                            st.success(f"PDF Extracted! ({len(raw_text)} chars)")
                             with st.expander("Preview & Edit", expanded=True):
                                 content_text = st.text_area("Edit text:", raw_text, height=200)
                         else:
-                            st.error(err)
+                            st.error(error_msg)
             else:
                 st.warning("Please install 'pypdf'")
 
         elif source_type == "Image Analysis":
             img_file = st.file_uploader("Upload Diagram", type=["png", "jpg", "jpeg"])
             if img_file:
-                raw_img       = Image.open(img_file)
-                image_content = compress_image(raw_img)   # Cat C #16
+                image_content = Image.open(img_file)
                 st.image(image_content, width=300)
-                orig_px = raw_img.width  * raw_img.height
-                comp_px = image_content.width * image_content.height
-                if orig_px > comp_px:
-                    st.caption(
-                        f"🗜️ Compressed to {image_content.width}×{image_content.height} "
-                        f"({comp_px/orig_px:.0%} of original pixels)"
-                    )
                 content_text = "Generate flashcards based on this image."
 
         elif source_type == "YouTube URL":
@@ -586,6 +453,7 @@ def section_generator(api_key):
                         video_id = extract_youtube_id(url)
                         if not video_id:
                             raise ValueError("Invalid YouTube URL.")
+                        # Single call — handles v1.x API + fallback, cached 1 h
                         raw_text = get_youtube_transcript(video_id)
                         st.success("✅ Transcript Extracted Successfully!")
                         with st.expander("Preview & Edit Transcript", expanded=True):
@@ -598,7 +466,7 @@ def section_generator(api_key):
         elif source_type == "Web Article":
             url = st.text_input("Article URL")
             if url:
-                with st.spinner("Fetching Webpage…"):
+                with st.spinner("Fetching Webpage..."):
                     try:
                         raw_text = fetch_web_content(url)
                         st.success("Web Content Extracted!")
@@ -613,26 +481,13 @@ def section_generator(api_key):
         difficulty = st.select_slider("Level", ["Beginner", "Intermediate", "Expert"], value="Intermediate")
         qty        = st.number_input("Count", 1, 30, 10)
 
-        # ── Daily API budget display — Cat C #4 ──────────────────────────
-        calls_today = _get_api_budget_count()
-        budget_pct  = calls_today / _API_DAILY_LIMIT
-        st.progress(min(budget_pct, 1.0))
-        if calls_today >= _API_DAILY_LIMIT:
-            st.error(f"🚫 Daily limit reached ({calls_today}/{_API_DAILY_LIMIT} calls)")
-        elif calls_today >= _API_WARN_AT:
-            st.warning(f"⚠️ API calls today: {calls_today}/{_API_DAILY_LIMIT}")
-        else:
-            st.caption(f"✅ API calls today: {calls_today}/{_API_DAILY_LIMIT}")
-        st.write("")
-
-        budget_exhausted = calls_today >= _API_DAILY_LIMIT
-
-        if st.button("🚀 Generate via AI", type="primary", use_container_width=True,
-                     disabled=budget_exhausted):
+        if st.button("🚀 Generate via AI", type="primary", use_container_width=True):
             if not api_key:                         st.error("API Key Missing");          return
             if not (content_text or image_content): st.warning("No valid content");       return
             if not deck_name:                       st.error("Please enter a Deck Name"); return
 
+            # ── Smart Rate-Limit Guard ────────────────────────────────────
+            # Calculates the EXACT remaining wait — never sleeps more than needed.
             elapsed     = time.perf_counter() - st.session_state["last_api_call_ts"]
             wait_needed = max(0.0, _API_MIN_INTERVAL - elapsed)
 
@@ -648,7 +503,6 @@ def section_generator(api_key):
                     st.session_state["last_api_call_ts"] = time.perf_counter()
                     cards  = generate_flashcards(api_key, content_text, image_content, difficulty, qty)
                     api_ms = (time.perf_counter() - t_api) * 1000
-                    _increment_api_budget()
 
                     st.write(f"✅ Gemini responded in {api_ms:.0f} ms")
                     st.write("💾 Saving to database…")
@@ -664,11 +518,10 @@ def section_generator(api_key):
                             deck_id = c.execute(
                                 "SELECT id FROM decks WHERE name=?", (deck_name,)
                             ).fetchone()[0]
-                            # Cat D #10: vectorized clean_text — entire batch in one list comp
                             data = [
                                 (deck_id,
-                                 _RE_BOLD.sub(r'<b>\1</b>', card['front']).strip(),
-                                 _RE_BOLD.sub(r'<b>\1</b>', card['back']).strip(),
+                                 clean_text(card['front']),
+                                 clean_text(card['back']),
                                  card.get('explanation', ''),
                                  card['tag'])
                                 for card in cards
@@ -759,6 +612,7 @@ def section_study():
         st.session_state["current_deck_id"] = deck_id
         with get_db_connection() as conn:
             if st.session_state["cram_mode"]:
+                # ── Select only the 5 fields we actually render ───────────
                 cards = conn.execute(
                     "SELECT id, front, back, explanation, tag FROM cards WHERE deck_id=? ORDER BY RANDOM() LIMIT 50",
                     (deck_id,)
@@ -770,14 +624,22 @@ def section_study():
                     (deck_id, datetime.now().strftime("%Y-%m-%d"))
                 ).fetchall()
 
+        # ── Session-state pruning: only store fields needed for rendering ──
         st.session_state["study_queue"] = [
-            {"id": c["id"], "front": c["front"], "back": c["back"],
-             "explanation": c["explanation"], "tag": c["tag"]}
+            {
+                "id":          c["id"],
+                "front":       c["front"],
+                "back":        c["back"],
+                "explanation": c["explanation"],
+                "tag":         c["tag"],
+            }
             for c in cards
         ]
         st.session_state["study_index"]   = 0
         st.session_state["show_answer"]   = False
-        st.session_state["session_stats"] = {"reviewed": 0, "correct": 0, "start_time": time.time()}
+        st.session_state["session_stats"] = {
+            "reviewed": 0, "correct": 0, "start_time": time.time()
+        }
 
     queue, idx = st.session_state["study_queue"], st.session_state["study_index"]
     if not queue:
@@ -789,8 +651,8 @@ def section_study():
 
         audio_html, back_content, explanation_html = "", "<span style='opacity:0.6;'>(Think…)</span>", ""
         if st.session_state["show_answer"]:
-            back_content = card['back']
-            audio_html   = text_to_speech_html(card['front'] + " ... " + card['back'])
+            back_content  = card['back']
+            audio_html    = text_to_speech_html(card['front'] + " ... " + card['back'])
             if card.get("explanation"):
                 explanation_html = f'<div class="card-explanation">💡 {card["explanation"]}</div>'
 
@@ -829,36 +691,30 @@ def section_study():
 
 def section_library():
     st.header("📚 Library")
-
-    # Only decks loaded at top — each tab fetches only its own data with explicit columns
+    # ── Single DB round-trip for all library data ─────────────────────────
     with get_db_connection() as conn:
-        decks = pd.read_sql("SELECT id, name, created_at FROM decks", conn)
+        df_cards = pd.read_sql("SELECT * FROM cards", conn)
+        decks    = pd.read_sql("SELECT * FROM decks", conn)
 
     if decks.empty:
         st.info("No decks."); return
 
     t1, t2, t3, t4 = st.tabs(["📊 Stats", "✏️ Edit Cards", "📤 Export", "🗑️ Manage"])
 
-    # ── Stats tab ─────────────────────────────────────────────────────────────
     with t1:
-        with get_db_connection() as conn:
-            # Cat B #9: explicit columns — only what Stats needs, no SM-2 math fields
-            df_stats = pd.read_sql(
-                "SELECT id, deck_id, repetitions, ease_factor, last_reviewed FROM cards", conn
-            )
-        if not df_stats.empty:
+        if not df_cards.empty:
             df_merged = pd.merge(
-                df_stats, decks,
+                df_cards, decks,
                 left_on="deck_id", right_on="id",
                 suffixes=('_card', '_deck')
             )
-            summary = df_merged.groupby("name").agg(
+            stats_df = df_merged.groupby("name").agg(
                 {"repetitions": "mean", "ease_factor": "mean", "id_card": "count"}
             ).rename(columns={"id_card": "Total Cards", "repetitions": "Avg Reps", "ease_factor": "Avg Ease"})
-            st.dataframe(summary, use_container_width=True)
-            if df_stats['last_reviewed'].notna().any():
-                df_stats['last_reviewed'] = pd.to_datetime(df_stats['last_reviewed']).dt.date
-                activity = df_stats['last_reviewed'].value_counts().reset_index()
+            st.dataframe(stats_df, use_container_width=True)
+            if df_cards['last_reviewed'].notna().any():
+                df_cards['last_reviewed'] = pd.to_datetime(df_cards['last_reviewed']).dt.date
+                activity = df_cards['last_reviewed'].value_counts().reset_index()
                 activity.columns = ['date', 'count']
                 st.altair_chart(
                     alt.Chart(activity).mark_rect().encode(
@@ -867,182 +723,68 @@ def section_library():
                     use_container_width=True
                 )
 
-    # ── Edit Cards tab ────────────────────────────────────────────────────────
     with t2:
-        # Cat B #7: deck-filtered — only load cards for the selected deck
-        selected_edit_deck = st.selectbox(
-            "Select deck to edit", decks['name'].tolist(), key="edit_deck_sel"
-        )
-        sel_deck_id = int(decks[decks['name'] == selected_edit_deck].iloc[0]['id'])
-
-        with get_db_connection() as conn:
-            # Cat B #9: only the 5 display fields
-            df_edit = pd.read_sql(
-                "SELECT id, front, back, explanation, tag FROM cards WHERE deck_id=?",
-                conn, params=(sel_deck_id,)
-            )
-
-        if df_edit.empty:
-            st.info("No cards in this deck yet.")
-        else:
-            # Cat B #21: Delete checkbox column for individual card removal
-            df_edit.insert(0, "delete", False)
+        if not df_cards.empty:
             edited = st.data_editor(
-                df_edit,
-                hide_index=True,
-                use_container_width=True,
-                disabled=["id"],
-                column_config={
-                    "delete": st.column_config.CheckboxColumn(
-                        "🗑️", help="Check rows to mark for deletion", default=False, width="small"
-                    )
-                }
+                df_cards[['id', 'front', 'back', 'explanation', 'tag']],
+                hide_index=True, use_container_width=True, disabled=["id"]
             )
+            if st.button("💾 Save to DB", type="primary"):
+                # ── Batch executemany — replaces N individual UPDATE calls ──
+                data = [
+                    (r['front'], r['back'], r['explanation'], r['tag'], r['id'])
+                    for _, r in edited.iterrows()
+                ]
+                with get_db_connection() as conn:
+                    conn.executemany(
+                        "UPDATE cards SET front=?, back=?, explanation=?, tag=? WHERE id=?",
+                        data
+                    )
+                    conn.commit()
+                st.success("Updated!")
 
-            col_save, col_del = st.columns(2)
-            with col_save:
-                if st.button("💾 Save Changes", type="primary", use_container_width=True):
-                    rows_to_save = edited[edited["delete"] == False]
-                    data = [
-                        (r['front'], r['back'], r['explanation'], r['tag'], r['id'])
-                        for _, r in rows_to_save.iterrows()
-                    ]
-                    with get_db_connection() as conn:
-                        conn.executemany(
-                            "UPDATE cards SET front=?, back=?, explanation=?, tag=? WHERE id=?",
-                            data
-                        )
-                        conn.commit()
-                    st.success(f"Saved {len(data)} cards!")
-
-            with col_del:
-                ids_to_delete = edited[edited["delete"] == True]['id'].tolist()
-                if ids_to_delete:
-                    if st.button(
-                        f"🗑️ Delete {len(ids_to_delete)} card(s)",
-                        type="secondary",
-                        use_container_width=True
-                    ):
-                        delete_cards_by_ids(ids_to_delete)
-                        st.toast(f"🗑️ Deleted {len(ids_to_delete)} card(s).")
-                        st.rerun()
-                else:
-                    st.button("🗑️ Delete Selected", disabled=True, use_container_width=True)
-
-    # ── Export tab ────────────────────────────────────────────────────────────
     with t3:
-        export_deck = st.selectbox("Export Deck", decks['name'].tolist(), key="exp_sel")
-        exp_deck_id = int(decks[decks['name'] == export_deck].iloc[0]['id'])
-
+        export_deck = st.selectbox("Export Deck", decks['name'].tolist())
+        deck_id_raw = decks[decks['name'] == export_deck].iloc[0]['id']
         with get_db_connection() as conn:
             cards_df = pd.read_sql(
-                "SELECT front, back, explanation, tag FROM cards WHERE deck_id=?",
-                conn, params=(exp_deck_id,)
+                "SELECT front, back, tag FROM cards WHERE deck_id=?",
+                conn, params=(int(deck_id_raw),)
             )
+        st.download_button(
+            "Download CSV",
+            data=(
+                cards_df.to_csv(index=False, header=False).encode('utf-8')
+                if not cards_df.empty else b""
+            ),
+            file_name=f"{export_deck}.csv",
+            disabled=cards_df.empty
+        )
 
-        col_csv, col_apkg = st.columns(2)
-        with col_csv:
-            st.download_button(
-                "📄 Download CSV",
-                data=(
-                    cards_df[['front','back','tag']].to_csv(index=False, header=False).encode('utf-8')
-                    if not cards_df.empty else b""
-                ),
-                file_name=f"{export_deck}.csv",
-                disabled=cards_df.empty,
-                use_container_width=True
-            )
-
-        with col_apkg:
-            if GENANKI_AVAILABLE:
-                if not cards_df.empty:
-                    apkg_bytes = export_deck_apkg(export_deck, cards_df)
-                    st.download_button(
-                        "📦 Download .apkg (Anki)",
-                        data=apkg_bytes,
-                        file_name=f"{export_deck}.apkg",
-                        mime="application/octet-stream",
-                        use_container_width=True
-                    )
-                else:
-                    st.button("📦 Download .apkg (Anki)", disabled=True, use_container_width=True)
-            else:
-                st.caption("Install `genanki` to enable Anki export.")
-
-    # ── Manage tab ────────────────────────────────────────────────────────────
     with t4:
         c1, c2 = st.columns(2)
-
         with c1:
-            st.subheader("Rename Deck")
-            ren   = st.selectbox("Select deck", decks['name'].tolist(), key="r_sel")
-            new_n = st.text_input("New name")
-            if st.button("✏️ Rename", use_container_width=True) and new_n:
+            ren   = st.selectbox("Rename", decks['name'].tolist(), key="r_sel")
+            new_n = st.text_input("New Name")
+            if st.button("Rename") and new_n:
                 if rename_deck(ren, new_n):
-                    st.toast(f'✅ Renamed to "{new_n}"')
+                    st.toast("✅ Deck renamed successfully!")  # replaces time.sleep(1)
                     st.rerun()
                 else:
-                    st.error("That name already exists.")
-
+                    st.error("Name already exists.")
         with c2:
-            st.subheader("Delete Deck")
-            d_del = st.selectbox("Select deck to delete", decks['name'].tolist(), key="d_sel")
-
-            # Confirmation gate — checkbox must be checked before button activates
-            card_count = 0
-            with get_db_connection() as conn:
-                row = conn.execute(
-                    "SELECT COUNT(*) FROM cards WHERE deck_id=(SELECT id FROM decks WHERE name=?)",
-                    (d_del,)
-                ).fetchone()
-                if row:
-                    card_count = row[0]
-
-            st.warning(
-                f'Deleting **"{d_del}"** will permanently remove '
-                f'the deck and all **{card_count} card(s)** inside it.',
-            )
-            confirmed = st.checkbox(
-                f'Yes, permanently delete "{d_del}"',
-                key=f"del_confirm_{d_del}"
-            )
-            st.button(
-                "🗑️ Delete Deck",
-                disabled=not confirmed,
-                type="primary" if confirmed else "secondary",
-                use_container_width=True,
-                on_click=lambda: (delete_deck(d_del), st.rerun()) if confirmed else None,
-                key="del_deck_btn"
-            )
-            if confirmed:
-                if st.session_state.get("del_deck_btn"):
-                    delete_deck(d_del)
-                    st.toast(f'🗑️ "{d_del}" and all its cards deleted.')
-                    st.rerun()
+            d_del = st.selectbox("Delete", decks['name'].tolist(), key="d_sel")
+            if st.button(f"🗑️ Delete {d_del}"):
+                delete_deck(d_del)
+                st.rerun()
 
 # ====================== 7. MAIN ======================
 
 def main():
     inject_custom_css()
-
-    # Cat D #22: one-shot DB init per session — not re-executed on every rerun
-    if not st.session_state["_db_initialized"]:
-        migrated = init_db()
-        st.session_state["_db_initialized"] = True
-        if migrated:
-            st.toast("🔧 Database schema updated to latest version.")
-
     with st.sidebar:
         st.title("🧠 Flashcard Pro")
-
-        # API key + inline validation  Cat C #13
         api_key = st.text_input("Gemini API Key", type="password")
-        if api_key:
-            if validate_api_key(api_key):
-                st.caption("✅ API key valid")
-            else:
-                st.caption("❌ Invalid API key")
-
         st.metric("Cards Due Today", get_due_cards_count())
         st.divider()
         page = st.radio(
