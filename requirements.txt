@@ -1,26 +1,12 @@
-# Flashcard Library Pro v7.0 — Full Dependency Block
-# Install with: pip install -r requirements.txt
-
-# ── Core Framework ──────────────────────────────────────────────────────────
 streamlit>=1.35.0
 pandas>=2.0.0
 altair>=5.0.0
-
-# ── AI & Schema ─────────────────────────────────────────────────────────────
+Pillow>=10.0.0
+requests>=2.31.0
 google-genai>=1.0.0
 pydantic>=2.0.0
-tenacity>=8.2.0
-
-# ── Media & Files ───────────────────────────────────────────────────────────
-Pillow>=10.0.0
 gTTS>=2.5.0
-pypdf>=4.0.0
-
-# ── Web & Extraction ────────────────────────────────────────────────────────
-requests>=2.31.0
+tenacity>=8.2.0
 beautifulsoup4>=4.12.0
-lxml>=5.0.0
-youtube-transcript-api>=0.6.0
-
-# ── Anki Export ─────────────────────────────────────────────────────────────
-genanki>=0.13.0
+youtube-transcript-api>=1.0.0
+pypdf>=4.0.0
