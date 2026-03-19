@@ -57,7 +57,6 @@ except ImportError:
     PDF_AVAILABLE = False
 
 # ====================== PRE-COMPILED REGEX PATTERNS ======================
-# Compiled once at import time — never recompiled per-call
 _RE_BOLD            = re.compile(r'\*\*(.*?)\*\*')
 _RE_CODE_FENCE_JSON = re.compile(r'^```json', re.MULTILINE)
 _RE_CODE_FENCE      = re.compile(r'^```',     re.MULTILINE)
@@ -73,6 +72,9 @@ _RE_ACCESS_DENIED   = re.compile(r'Access Denied|edgesuite\.net|Reference #')
 # ====================== API RATE-LIMIT CONSTANTS ======================
 _API_MIN_INTERVAL = 12.0   # seconds — enforces 5 RPM (Free Tier)
 
+# ====================== COOKIE FILE PATH ======================
+_COOKIE_PATH = "/tmp/yt_cookies.txt"
+
 # ====================== SESSION STATE DEFAULTS ======================
 DEFAULT_STATE = {
     "current_deck_id":  None,
@@ -81,7 +83,8 @@ DEFAULT_STATE = {
     "show_answer":      False,
     "session_stats":    {"reviewed": 0, "correct": 0, "start_time": None},
     "cram_mode":        False,
-    "last_api_call_ts": 0.0,   # time.perf_counter() of last Gemini call
+    "last_api_call_ts": 0.0,
+    "cookie_path":      None,   # ← NEW: path to uploaded cookies.txt
 }
 
 for key, value in DEFAULT_STATE.items():
@@ -92,12 +95,11 @@ for key, value in DEFAULT_STATE.items():
 DB_NAME = "flashcards_v5.db"
 
 def get_db_connection():
-    """Open a SQLite connection with WAL, 8 MB read cache, and NORMAL sync."""
     conn = sqlite3.connect(DB_NAME, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA cache_size=-8000;")     # 8 MB page cache
-    conn.execute("PRAGMA synchronous=NORMAL;")   # Safe with WAL; ~2× faster writes
+    conn.execute("PRAGMA cache_size=-8000;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
     return conn
 
 def init_db():
@@ -122,7 +124,6 @@ def init_db():
             last_reviewed TEXT,
             FOREIGN KEY(deck_id) REFERENCES decks(id) ON DELETE CASCADE)''')
 
-        # Schema migration guards
         try:    c.execute("SELECT explanation FROM cards LIMIT 1")
         except sqlite3.OperationalError:
             c.execute("ALTER TABLE cards ADD COLUMN explanation TEXT DEFAULT ''")
@@ -130,7 +131,6 @@ def init_db():
         except sqlite3.OperationalError:
             c.execute("ALTER TABLE cards ADD COLUMN last_reviewed TEXT")
 
-        # ── Performance indexes (idempotent) ─────────────────────────────
         c.execute("CREATE INDEX IF NOT EXISTS idx_cards_deck_review ON cards(deck_id, next_review)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_cards_deck_id    ON cards(deck_id)")
         conn.commit()
@@ -175,7 +175,6 @@ def rename_deck(old_name, new_name):
 
 @st.cache_data(ttl=30, show_spinner=False)
 def get_due_cards_count():
-    """Cached for 30 s — prevents a DB query on every single UI interaction."""
     today = datetime.now().strftime("%Y-%m-%d")
     with get_db_connection() as conn:
         return conn.execute(
@@ -212,10 +211,6 @@ def extract_pdf_text(uploaded_file):
 
 @functools.lru_cache(maxsize=64)
 def extract_youtube_id(url: str):
-    """
-    Extract video ID from any YouTube URL format.
-    LRU-cached so repeated calls are instant dict lookups.
-    """
     patterns = [
         r'(?:v=)([\w-]{11})',
         r'(?:youtu\.be/)([\w-]{11})',
@@ -226,27 +221,34 @@ def extract_youtube_id(url: str):
         m = re.search(pattern, url)
         if m:
             return m.group(1)
-    # Bare video ID
     if re.match(r'^[\w-]{11}$', url.strip()):
         return url.strip()
     return None
 
+# ── FIX 1: Cookie-aware YouTubeTranscriptApi instance ────────────────────────
 @st.cache_resource
-def get_youtube_api():
+def get_youtube_api(cookie_path: str = None):
     """
-    Single YouTubeTranscriptApi instance reused for the app lifetime.
-    Avoids creating a new object on every transcript request.
+    Returns a YouTubeTranscriptApi instance.
+    If a valid cookies.txt path is provided, it is passed to the API so that
+    YouTube treats requests as authenticated — bypassing bot-blocking.
+    The result is cached per unique cookie_path so a new instance is only
+    created when the cookie file changes.
     """
-    if YOUTUBE_AVAILABLE:
-        return YouTubeTranscriptApi()
-    return None
+    if not YOUTUBE_AVAILABLE:
+        return None
+    if cookie_path and os.path.exists(cookie_path):
+        try:
+            return YouTubeTranscriptApi(cookies=cookie_path)
+        except TypeError:
+            # Older builds of the library don't accept the cookies kwarg;
+            # fall back to unauthenticated instance silently.
+            pass
+    return YouTubeTranscriptApi()
 
 def _scrape_youtube_transcript(video_id: str) -> str:
     """
-    Multi-stage HTML scrape fallback used when the library is unavailable
-    or when the video is region-restricted for the library but still has
-    a public caption XML endpoint.
-
+    Multi-stage HTML scrape fallback.
     Stage 1 — Native HTML parse (regex on ytInitialPlayerResponse)
     Stage 2 — Public proxy API (youtubetranscript.com)
     """
@@ -256,7 +258,7 @@ def _scrape_youtube_transcript(video_id: str) -> str:
     }
     cookies = {"CONSENT": "YES+cb.20210328-17-p0.en+FX+478"}
 
-    # Stage 1 — parse captionTracks from page HTML
+    # Stage 1
     try:
         page_html = requests.get(
             f"https://www.youtube.com/watch?v={video_id}",
@@ -264,15 +266,15 @@ def _scrape_youtube_transcript(video_id: str) -> str:
         ).text
         m = _RE_CAPTIONS.search(page_html)
         if m:
-            xml_url     = json.loads(m.group(1))[0]['baseUrl']
-            xml_resp    = requests.get(xml_url, headers=headers, timeout=10)
-            transcript  = _RE_HTML_TAGS.sub(' ', xml_resp.text)
-            transcript  = html.unescape(transcript)
+            xml_url    = json.loads(m.group(1))[0]['baseUrl']
+            xml_resp   = requests.get(xml_url, headers=headers, timeout=10)
+            transcript = _RE_HTML_TAGS.sub(' ', xml_resp.text)
+            transcript = html.unescape(transcript)
             return _RE_WHITESPACE.sub(' ', transcript).strip()
     except Exception:
         pass
 
-    # Stage 2 — public proxy
+    # Stage 2
     try:
         proxy = requests.get(
             f"https://youtubetranscript.com/?server_vid2={video_id}", timeout=10
@@ -287,30 +289,30 @@ def _scrape_youtube_transcript(video_id: str) -> str:
     raise ValueError("All extraction methods failed. The video may not have closed captions.")
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_youtube_transcript(video_id: str) -> str:
+def get_youtube_transcript(video_id: str, cookie_path: str = None) -> str:
     """
-    Primary transcript engine — results cached 1 hour per video ID.
+    Primary transcript engine — results cached 1 hour per (video_id, cookie_path) pair.
 
-    Plan A  youtube-transcript-api v1.x (instantiated once via cache_resource)
-              • find_transcript(['en'])  →  first available  →  translate fallback
-              • Uses TextFormatter for clean plain-text output
-    Plan B/C  HTML scrape (_scrape_youtube_transcript)
+    Plan A  youtube-transcript-api v1.x with optional cookie authentication
+              Cookies allow YouTube to treat the request as a real logged-in
+              browser, bypassing the bot-detection that causes the blocking
+              shown in the screenshot.
+    Plan B/C  HTML scrape fallback (_scrape_youtube_transcript)
     """
-    # ── Plan A: youtube-transcript-api v1.x ──────────────────────────────
+    # ── Plan A: youtube-transcript-api (cookie-aware) ────────────────────
     if YOUTUBE_AVAILABLE:
         try:
-            ytt             = get_youtube_api()
+            ytt             = get_youtube_api(cookie_path)
             transcript_list = ytt.list(video_id)
             try:
                 transcript = transcript_list.find_transcript(['en'])
             except Exception:
-                # No English available — grab whatever is first and translate
                 transcript = next(iter(transcript_list))
             fetched   = transcript.fetch()
             formatter = YTTextFormatter()
             return formatter.format_transcript(fetched)
         except Exception:
-            pass  # fall through to scrape methods
+            pass
 
     # ── Plan B/C: HTML scrape fallback ───────────────────────────────────
     return _scrape_youtube_transcript(video_id)
@@ -326,7 +328,6 @@ def clean_web_markdown(text):
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_web_content(url: str) -> str:
-    """Fetch and clean web article. Cached 5 minutes — same URL never re-fetched."""
     try:
         resp = requests.get(f"https://r.jina.ai/{url}", timeout=15)
         resp.raise_for_status()
@@ -374,11 +375,6 @@ def generate_flashcards(api_key, text_content, image_content, difficulty, count_
 
 @st.cache_data(show_spinner=False)
 def text_to_speech_html(text: str) -> str:
-    """
-    Generate base64 audio HTML for a card.
-    Cached indefinitely — the same card text always produces the same audio,
-    so Google TTS is never called twice for the same string.
-    """
     try:
         clean = _RE_HTML_TAGS.sub('', text)
         tts   = gTTS(text=clean, lang='en')
@@ -402,6 +398,7 @@ def inject_custom_css():
         .card-back { font-size: 18px; margin-bottom: 15px; color: var(--primary-color); line-height: 1.5; }
         .card-explanation { font-size: 14px; color: var(--text-color); opacity: 0.8; font-style: italic; border-top: 1px solid var(--text-color); padding-top: 10px; width: 100%; }
         .card-tag { background: var(--primary-color); color: #ffffff; padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: 600; text-transform: uppercase; margin-bottom: 15px; }
+        .cookie-box { background: #1a1a2e; border: 1px solid #4a4a8a; border-radius: 10px; padding: 12px; margin-top: 8px; font-size: 13px; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -453,15 +450,22 @@ def section_generator(api_key):
                         video_id = extract_youtube_id(url)
                         if not video_id:
                             raise ValueError("Invalid YouTube URL.")
-                        # Single call — handles v1.x API + fallback, cached 1 h
-                        raw_text = get_youtube_transcript(video_id)
+                        # Pass cookie_path — None if not uploaded, real path if cookies loaded
+                        cookie_path = st.session_state.get("cookie_path")
+                        raw_text    = get_youtube_transcript(video_id, cookie_path)
                         st.success("✅ Transcript Extracted Successfully!")
                         with st.expander("Preview & Edit Transcript", expanded=True):
                             content_text = st.text_area(
                                 "Edit text before generating:", raw_text, height=200
                             )
                     except Exception as e:
-                        st.error(f"Error extracting transcript: {str(e)}")
+                        st.error(f"Transcript blocked by YouTube: {str(e)}")
+                        st.info(
+                            "💡 **Fix:** Export your YouTube cookies as `cookies.txt` "
+                            "(using a browser extension like *Get cookies.txt LOCALLY* "
+                            "or your Kiwi browser extension) and upload them in the sidebar "
+                            "under **YouTube Cookies** to bypass this restriction."
+                        )
 
         elif source_type == "Web Article":
             url = st.text_input("Article URL")
@@ -486,8 +490,6 @@ def section_generator(api_key):
             if not (content_text or image_content): st.warning("No valid content");       return
             if not deck_name:                       st.error("Please enter a Deck Name"); return
 
-            # ── Smart Rate-Limit Guard ────────────────────────────────────
-            # Calculates the EXACT remaining wait — never sleeps more than needed.
             elapsed     = time.perf_counter() - st.session_state["last_api_call_ts"]
             wait_needed = max(0.0, _API_MIN_INTERVAL - elapsed)
 
@@ -612,7 +614,6 @@ def section_study():
         st.session_state["current_deck_id"] = deck_id
         with get_db_connection() as conn:
             if st.session_state["cram_mode"]:
-                # ── Select only the 5 fields we actually render ───────────
                 cards = conn.execute(
                     "SELECT id, front, back, explanation, tag FROM cards WHERE deck_id=? ORDER BY RANDOM() LIMIT 50",
                     (deck_id,)
@@ -624,7 +625,6 @@ def section_study():
                     (deck_id, datetime.now().strftime("%Y-%m-%d"))
                 ).fetchall()
 
-        # ── Session-state pruning: only store fields needed for rendering ──
         st.session_state["study_queue"] = [
             {
                 "id":          c["id"],
@@ -691,7 +691,6 @@ def section_study():
 
 def section_library():
     st.header("📚 Library")
-    # ── Single DB round-trip for all library data ─────────────────────────
     with get_db_connection() as conn:
         df_cards = pd.read_sql("SELECT * FROM cards", conn)
         decks    = pd.read_sql("SELECT * FROM decks", conn)
@@ -730,7 +729,6 @@ def section_library():
                 hide_index=True, use_container_width=True, disabled=["id"]
             )
             if st.button("💾 Save to DB", type="primary"):
-                # ── Batch executemany — replaces N individual UPDATE calls ──
                 data = [
                     (r['front'], r['back'], r['explanation'], r['tag'], r['id'])
                     for _, r in edited.iterrows()
@@ -768,7 +766,7 @@ def section_library():
             new_n = st.text_input("New Name")
             if st.button("Rename") and new_n:
                 if rename_deck(ren, new_n):
-                    st.toast("✅ Deck renamed successfully!")  # replaces time.sleep(1)
+                    st.toast("✅ Deck renamed successfully!")
                     st.rerun()
                 else:
                     st.error("Name already exists.")
@@ -786,6 +784,38 @@ def main():
         st.title("🧠 Flashcard Pro")
         api_key = st.text_input("Gemini API Key", type="password")
         st.metric("Cards Due Today", get_due_cards_count())
+        st.divider()
+
+        # ── FIX 1: YouTube Cookie Upload ─────────────────────────────────
+        st.subheader("🍪 YouTube Cookies")
+        st.caption(
+            "Upload a `cookies.txt` (Netscape format) exported from your browser "
+            "to bypass YouTube's bot-blocking on transcripts."
+        )
+        cookie_file = st.file_uploader(
+            "cookies.txt", type=["txt"], key="yt_cookie_upload",
+            label_visibility="collapsed"
+        )
+        if cookie_file is not None:
+            # Write to a stable /tmp path so get_youtube_api() can find it
+            cookie_bytes = cookie_file.getvalue()
+            with open(_COOKIE_PATH, "wb") as f:
+                f.write(cookie_bytes)
+            st.session_state["cookie_path"] = _COOKIE_PATH
+            st.success("✅ Cookies loaded!")
+        elif st.session_state.get("cookie_path") and os.path.exists(_COOKIE_PATH):
+            # Cookies were loaded in a previous run — still active
+            st.success("✅ Cookies active (session)")
+            if st.button("🗑️ Remove Cookies"):
+                os.remove(_COOKIE_PATH)
+                st.session_state["cookie_path"] = None
+                # Clear transcript cache so next request uses no-cookie instance
+                get_youtube_transcript.clear()
+                get_youtube_api.clear()
+                st.rerun()
+        else:
+            st.info("No cookies loaded — some videos may be blocked.")
+
         st.divider()
         page = st.radio(
             "Navigation",
