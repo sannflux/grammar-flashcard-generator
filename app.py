@@ -68,6 +68,7 @@ _RE_LINK            = re.compile(r'\[([^\]]+)\]\([^\)]+\)')
 _RE_MULTILINE       = re.compile(r'\n\s*\n')
 _RE_CAPTIONS        = re.compile(r'"captionTracks"\s*:\s*(\[.*?\])')
 _RE_ACCESS_DENIED   = re.compile(r'Access Denied|edgesuite\.net|Reference #')
+_RE_WORD            = re.compile(r'\b\w+\b')
 
 # ====================== API RATE-LIMIT CONSTANTS ======================
 _API_MIN_INTERVAL = 12.0   # seconds — enforces 5 RPM (Free Tier)
@@ -84,7 +85,7 @@ DEFAULT_STATE = {
     "session_stats":    {"reviewed": 0, "correct": 0, "start_time": None},
     "cram_mode":        False,
     "last_api_call_ts": 0.0,
-    "cookie_path":      None,   # ← NEW: path to uploaded cookies.txt
+    "cookie_path":      None,
 }
 
 for key, value in DEFAULT_STATE.items():
@@ -182,14 +183,42 @@ def get_due_cards_count():
         ).fetchone()[0]
 
 # ====================== 4. AI CONTENT ENGINE & EXTRACTORS ======================
+
+# ── FIX 1: source_quote field anchors every card to real source text ──────────
 class Flashcard(BaseModel):
-    front:       str = Field(description="The question/concept. Plain text.")
-    back:        str = Field(description="The answer. Use HTML <b> for key terms.")
-    explanation: str = Field(description="A short context or mnemonic explaining WHY the answer is correct.")
-    tag:         str = Field(description="A short category tag.")
+    front:        str = Field(
+        description=(
+            "The question or concept to test. Plain text only. "
+            "MUST be derived directly from the provided source material — "
+            "do NOT introduce facts or definitions not present in the source."
+        )
+    )
+    back:         str = Field(
+        description=(
+            "The answer. Use HTML <b> tags for key terms. "
+            "Every fact stated here MUST appear verbatim or as a close paraphrase "
+            "in the source material. Do NOT add outside knowledge."
+        )
+    )
+    explanation:  str = Field(
+        description=(
+            "A brief mnemonic or context note that explains WHY the answer is correct, "
+            "grounded exclusively in the provided content."
+        )
+    )
+    tag:          str = Field(description="A short category tag.")
+    source_quote: str = Field(
+        description=(
+            "A short verbatim excerpt (10–25 words) copied directly from the source "
+            "material that contains the evidence for this card's answer. "
+            "If no exact supporting passage exists in the source, set this to an empty string "
+            "and omit the card entirely."
+        )
+    )
 
 class FlashcardSet(BaseModel):
     cards: List[Flashcard]
+
 
 def clean_text(text):
     if not text: return ""
@@ -206,6 +235,65 @@ def extract_pdf_text(uploaded_file):
         return text[:25000], None
     except Exception as e:
         return None, f"Error reading PDF: {str(e)}"
+
+
+# ── FIX 2: Post-generation grounding validator ────────────────────────────────
+def _validate_cards_against_source(
+    cards: list,
+    source_text: str,
+    min_overlap: float = 0.55,
+) -> tuple:
+    """
+    Returns (valid_cards, rejected_cards).
+
+    For each card the model produced a `source_quote`.  We tokenise both the
+    quote and the full source and compute what fraction of the quote's words
+    appear in the source.  Cards whose quote has < min_overlap word-overlap
+    with the source are rejected as likely hallucinations.
+
+    Image-only requests (no source_text) skip validation and pass everything.
+    """
+    if not source_text or not source_text.strip():
+        return cards, []
+
+    # Stop-words that carry no semantic signal — excluded from overlap scoring
+    _STOP = {
+        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+        "of", "in", "on", "at", "to", "for", "with", "by", "from", "as",
+        "it", "its", "that", "this", "these", "those", "and", "or", "but",
+        "not", "no", "so", "if", "then", "than", "also", "can", "will",
+        "may", "has", "have", "had", "do", "does", "did",
+    }
+
+    source_words = {
+        w for w in _RE_WORD.findall(source_text.lower()) if w not in _STOP
+    }
+
+    valid, rejected = [], []
+    for card in cards:
+        quote = (card.get("source_quote") or "").strip()
+
+        # Model signalled no supporting passage → reject immediately
+        if not quote:
+            rejected.append(card)
+            continue
+
+        quote_tokens = [
+            w for w in _RE_WORD.findall(quote.lower()) if w not in _STOP
+        ]
+        if not quote_tokens:
+            # Quote is all stop-words — can't score, give benefit of the doubt
+            valid.append(card)
+            continue
+
+        overlap = sum(1 for w in quote_tokens if w in source_words) / len(quote_tokens)
+        if overlap >= min_overlap:
+            valid.append(card)
+        else:
+            rejected.append(card)
+
+    return valid, rejected
+
 
 # ── YouTube helpers ───────────────────────────────────────────────────────────
 
@@ -225,40 +313,24 @@ def extract_youtube_id(url: str):
         return url.strip()
     return None
 
-# ── FIX 1: Cookie-aware YouTubeTranscriptApi instance ────────────────────────
 @st.cache_resource
 def get_youtube_api(cookie_path: str = None):
-    """
-    Returns a YouTubeTranscriptApi instance.
-    If a valid cookies.txt path is provided, it is passed to the API so that
-    YouTube treats requests as authenticated — bypassing bot-blocking.
-    The result is cached per unique cookie_path so a new instance is only
-    created when the cookie file changes.
-    """
     if not YOUTUBE_AVAILABLE:
         return None
     if cookie_path and os.path.exists(cookie_path):
         try:
             return YouTubeTranscriptApi(cookies=cookie_path)
         except TypeError:
-            # Older builds of the library don't accept the cookies kwarg;
-            # fall back to unauthenticated instance silently.
             pass
     return YouTubeTranscriptApi()
 
 def _scrape_youtube_transcript(video_id: str) -> str:
-    """
-    Multi-stage HTML scrape fallback.
-    Stage 1 — Native HTML parse (regex on ytInitialPlayerResponse)
-    Stage 2 — Public proxy API (youtubetranscript.com)
-    """
     headers = {
         "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept-Language": "en-US,en;q=0.9",
     }
     cookies = {"CONSENT": "YES+cb.20210328-17-p0.en+FX+478"}
 
-    # Stage 1
     try:
         page_html = requests.get(
             f"https://www.youtube.com/watch?v={video_id}",
@@ -274,7 +346,6 @@ def _scrape_youtube_transcript(video_id: str) -> str:
     except Exception:
         pass
 
-    # Stage 2
     try:
         proxy = requests.get(
             f"https://youtubetranscript.com/?server_vid2={video_id}", timeout=10
@@ -290,16 +361,6 @@ def _scrape_youtube_transcript(video_id: str) -> str:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_youtube_transcript(video_id: str, cookie_path: str = None) -> str:
-    """
-    Primary transcript engine — results cached 1 hour per (video_id, cookie_path) pair.
-
-    Plan A  youtube-transcript-api v1.x with optional cookie authentication
-              Cookies allow YouTube to treat the request as a real logged-in
-              browser, bypassing the bot-detection that causes the blocking
-              shown in the screenshot.
-    Plan B/C  HTML scrape fallback (_scrape_youtube_transcript)
-    """
-    # ── Plan A: youtube-transcript-api (cookie-aware) ────────────────────
     if YOUTUBE_AVAILABLE:
         try:
             ytt             = get_youtube_api(cookie_path)
@@ -314,7 +375,6 @@ def get_youtube_transcript(video_id: str, cookie_path: str = None) -> str:
         except Exception:
             pass
 
-    # ── Plan B/C: HTML scrape fallback ───────────────────────────────────
     return _scrape_youtube_transcript(video_id)
 
 # ── Web content ───────────────────────────────────────────────────────────────
@@ -346,19 +406,44 @@ def fetch_web_content(url: str) -> str:
 
 # ── Gemini ────────────────────────────────────────────────────────────────────
 
+# ── FIX 3: Tightened system prompt + temperature=0.1 ─────────────────────────
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
 def generate_flashcards(api_key, text_content, image_content, difficulty, count_val):
-    client        = genai.Client(api_key=api_key)
+    client = genai.Client(api_key=api_key)
+
+    # Build a content-bounded context block so the model can reference it
+    source_block = ""
+    if text_content:
+        source_block = (
+            f"\n\n<SOURCE_MATERIAL>\n{text_content}\n</SOURCE_MATERIAL>\n\n"
+        )
+
     system_prompt = (
-        f"Act as a professor for {difficulty} level students. "
-        f"Create {count_val} flashcards strictly based on the core educational content provided. "
-        "IGNORE website navigation menus, sidebars, 'Log in' prompts, and comment sections. "
-        "Focus ONLY on actual definitions, rules, or educational topics. "
-        "Output JSON only. 'back' field MUST use <b>bold</b> tags for keywords."
+        f"You are a professor creating flashcards for {difficulty}-level students.\n\n"
+        "## STRICT GROUNDING RULES — READ CAREFULLY\n"
+        "1. Every flashcard MUST be derived EXCLUSIVELY from the text inside "
+        "<SOURCE_MATERIAL> tags (or the provided image). "
+        "Do NOT use your general training knowledge to add, infer, or embellish facts.\n"
+        "2. The `back` field must state only facts that are explicitly present "
+        "in the source. If a fact is not there, do not include it.\n"
+        "3. The `source_quote` field MUST contain a short verbatim excerpt "
+        "(10–25 words) copied directly from the source that contains the evidence "
+        "for this card. If no supporting passage exists, omit the card entirely — "
+        "do NOT fabricate a quote.\n"
+        "4. IGNORE navigation menus, login prompts, ads, and comment sections.\n"
+        "5. Output JSON only. Use <b>bold</b> HTML tags in the `back` field for key terms.\n"
+        f"6. Create exactly {count_val} flashcards — fewer if the source does not "
+        "contain enough distinct facts."
     )
+
     contents = []
-    if text_content:  contents.append(text_content)
-    if image_content: contents.append(image_content)
+    if source_block:
+        contents.append(source_block)
+    elif text_content:
+        contents.append(text_content)
+    if image_content:
+        contents.append(image_content)
+
     response = client.models.generate_content(
         model="gemini-2.5-flash-lite",
         contents=contents,
@@ -366,7 +451,7 @@ def generate_flashcards(api_key, text_content, image_content, difficulty, count_
             system_instruction=system_prompt,
             response_mime_type="application/json",
             response_schema=FlashcardSet,
-            temperature=0.3
+            temperature=0.1,          # FIX 3: lower = less creative confabulation
         )
     )
     return json.loads(sanitize_json(response.text)).get("cards", [])
@@ -440,7 +525,7 @@ def section_generator(api_key):
             if img_file:
                 image_content = Image.open(img_file)
                 st.image(image_content, width=300)
-                content_text = "Generate flashcards based on this image."
+                content_text = ""   # image-only; validator will skip grounding check
 
         elif source_type == "YouTube URL":
             url = st.text_input("Video URL")
@@ -450,7 +535,6 @@ def section_generator(api_key):
                         video_id = extract_youtube_id(url)
                         if not video_id:
                             raise ValueError("Invalid YouTube URL.")
-                        # Pass cookie_path — None if not uploaded, real path if cookies loaded
                         cookie_path = st.session_state.get("cookie_path")
                         raw_text    = get_youtube_transcript(video_id, cookie_path)
                         st.success("✅ Transcript Extracted Successfully!")
@@ -462,9 +546,7 @@ def section_generator(api_key):
                         st.error(f"Transcript blocked by YouTube: {str(e)}")
                         st.info(
                             "💡 **Fix:** Export your YouTube cookies as `cookies.txt` "
-                            "(using a browser extension like *Get cookies.txt LOCALLY* "
-                            "or your Kiwi browser extension) and upload them in the sidebar "
-                            "under **YouTube Cookies** to bypass this restriction."
+                            "and upload them in the sidebar under **YouTube Cookies**."
                         )
 
         elif source_type == "Web Article":
@@ -503,10 +585,32 @@ def section_generator(api_key):
 
                 try:
                     st.session_state["last_api_call_ts"] = time.perf_counter()
-                    cards  = generate_flashcards(api_key, content_text, image_content, difficulty, qty)
+                    raw_cards = generate_flashcards(
+                        api_key, content_text, image_content, difficulty, qty
+                    )
                     api_ms = (time.perf_counter() - t_api) * 1000
-
                     st.write(f"✅ Gemini responded in {api_ms:.0f} ms")
+
+                    # ── FIX 2: Grounding validation ───────────────────────
+                    st.write("🔍 Validating cards against source…")
+                    cards, rejected = _validate_cards_against_source(
+                        raw_cards, content_text
+                    )
+
+                    if rejected:
+                        st.warning(
+                            f"⚠️ {len(rejected)} card(s) removed: their claimed quotes "
+                            "could not be matched back to your source material "
+                            "(likely hallucinations)."
+                        )
+                        with st.expander("🗑️ Rejected cards (hallucination log)", expanded=False):
+                            for rc in rejected:
+                                st.markdown(
+                                    f"**Q:** {rc.get('front','—')}  \n"
+                                    f"**A:** {_RE_HTML_TAGS.sub('', rc.get('back','—'))}  \n"
+                                    f"**Unverified quote:** _{rc.get('source_quote','(none)')}_"
+                                )
+
                     st.write("💾 Saving to database…")
 
                     if cards:
@@ -535,11 +639,19 @@ def section_generator(api_key):
                             conn.commit()
                         db_ms = (time.perf_counter() - t_db) * 1000
                         status.update(
-                            label=f"✅ {len(cards)} cards created!  (API: {api_ms:.0f} ms | DB: {db_ms:.0f} ms)",
+                            label=(
+                                f"✅ {len(cards)} verified cards created"
+                                + (f" ({len(rejected)} hallucinations removed)" if rejected else "")
+                                + f"  (API: {api_ms:.0f} ms | DB: {db_ms:.0f} ms)"
+                            ),
                             state="complete"
                         )
                     else:
-                        status.update(label="⚠️ No cards returned by Gemini.", state="error")
+                        status.update(
+                            label="⚠️ No cards passed grounding validation. "
+                                  "Try providing more detailed source material.",
+                            state="error"
+                        )
 
                 except Exception as e:
                     status.update(label="❌ Generation failed", state="error")
@@ -786,7 +898,6 @@ def main():
         st.metric("Cards Due Today", get_due_cards_count())
         st.divider()
 
-        # ── FIX 1: YouTube Cookie Upload ─────────────────────────────────
         st.subheader("🍪 YouTube Cookies")
         st.caption(
             "Upload a `cookies.txt` (Netscape format) exported from your browser "
@@ -797,19 +908,16 @@ def main():
             label_visibility="collapsed"
         )
         if cookie_file is not None:
-            # Write to a stable /tmp path so get_youtube_api() can find it
             cookie_bytes = cookie_file.getvalue()
             with open(_COOKIE_PATH, "wb") as f:
                 f.write(cookie_bytes)
             st.session_state["cookie_path"] = _COOKIE_PATH
             st.success("✅ Cookies loaded!")
         elif st.session_state.get("cookie_path") and os.path.exists(_COOKIE_PATH):
-            # Cookies were loaded in a previous run — still active
             st.success("✅ Cookies active (session)")
             if st.button("🗑️ Remove Cookies"):
                 os.remove(_COOKIE_PATH)
                 st.session_state["cookie_path"] = None
-                # Clear transcript cache so next request uses no-cookie instance
                 get_youtube_transcript.clear()
                 get_youtube_api.clear()
                 st.rerun()
